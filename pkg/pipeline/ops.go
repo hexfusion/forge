@@ -4,12 +4,54 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
+	"time"
 )
 
-// statusAll prints a summary of all instances.
+// statusAll prints a summary of all instances from the state store.
 func statusAll(cfg *Config) error {
+	states, err := ListStates()
+	if err != nil || len(states) == 0 {
+		// Fall back to config file if no state files yet
+		return statusAllFromConfig(cfg)
+	}
+
+	fmt.Printf("%-20s %-8s %-8s %-8s %-10s %s\n",
+		"INSTANCE", "STATUS", "BUILT", "PUSHED", "DEPLOYED", "DESCRIPTION")
+	fmt.Printf("%-20s %-8s %-8s %-8s %-10s %s\n",
+		"--------", "------", "-----", "------", "--------", "-----------")
+
+	for _, state := range states {
+		drift, _ := state.CheckDrift()
+		built := "no"
+		pushed := "no"
+		deployed := "no"
+
+		if drift != nil {
+			if drift.Built {
+				built = "yes"
+			}
+			if drift.Pushed {
+				pushed = "yes"
+			}
+			if drift.Deployed {
+				if drift.DeployStale {
+					deployed = "stale"
+				} else if drift.DigestMatch {
+					deployed = "current"
+				} else {
+					deployed = "drift"
+				}
+			}
+		}
+
+		fmt.Printf("%-20s %-8s %-8s %-8s %-10s %s\n",
+			state.Name, state.Status, built, pushed, deployed, state.Description)
+	}
+	return nil
+}
+
+func statusAllFromConfig(cfg *Config) error {
 	fmt.Printf("%-20s %-10s %s\n", "INSTANCE", "STATUS", "DESCRIPTION")
 	fmt.Printf("%-20s %-10s %s\n", "--------", "------", "-----------")
 	for name, inst := range cfg.Instances {
@@ -20,11 +62,101 @@ func statusAll(cfg *Config) error {
 
 // statusInstance prints detailed state for one instance.
 func statusInstance(cfg *Config, name string) error {
+	// Try state file first
+	state, stateErr := LoadState(name)
+	if stateErr == nil {
+		return statusFromState(state)
+	}
+
+	// Fall back to config
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
 		return err
 	}
+	return statusFromConfig(name, inst)
+}
 
+func statusFromState(state *InstanceState) error {
+	fmt.Printf("Instance:    %s\n", state.Name)
+	fmt.Printf("Project:     %s\n", state.Project)
+	fmt.Printf("Status:      %s\n", state.Status)
+	fmt.Printf("Created:     %s\n\n", state.Created.Format("2006-01-02"))
+
+	fmt.Println("Repos:")
+	for repoName, repo := range state.Repos {
+		branch, dirty, commit := repoState(repo.Local)
+		dirtyStr := "[clean]"
+		if dirty {
+			dirtyStr = "[dirty]"
+		}
+		syncStr := ""
+		if repo.LastSyncCommit != "" {
+			if startsWith(commit, repo.LastSyncCommit) {
+				syncStr = " synced"
+			} else {
+				syncStr = " unsynced"
+			}
+		}
+		fmt.Printf("  %-40s %-30s %s %s%s\n",
+			repoName, branch, commit, dirtyStr, syncStr)
+		fmt.Printf("  %-40s → %s\n", "", repo.Fork)
+	}
+
+	if len(state.ReplaceDirectives) > 0 {
+		fmt.Println("\nReplace Directives:")
+		for _, rd := range state.ReplaceDirectives {
+			fmt.Printf("  %s go.mod: %s\n", rd.Source, rd.GoModLine)
+		}
+	}
+
+	fmt.Println("\nImages:")
+	for imgName, img := range state.Images {
+		builtStr := "not built"
+		if img.BuildTime != nil {
+			builtStr = fmt.Sprintf("built %s", img.BuildTime.Format("2006-01-02 15:04"))
+		}
+		pushedStr := ""
+		if img.Pushed {
+			pushedStr = " pushed"
+		}
+		fmt.Printf("  %-10s %s\n", imgName, img.Tag)
+		fmt.Printf("  %-10s %s%s\n", "", builtStr, pushedStr)
+		if img.Digest != "" {
+			fmt.Printf("  %-10s digest: %s\n", "", truncateDigest(img.Digest))
+		}
+	}
+
+	if state.Deploy != nil {
+		fmt.Printf("\nDeploy:\n")
+		fmt.Printf("  cluster:    %s\n", state.Deploy.KubeContext)
+		fmt.Printf("  namespace:  %s\n", state.Deploy.Namespace)
+		fmt.Printf("  deployment: %s\n", state.Deploy.Deployment)
+
+		if state.Deploy.DeployedDigest != "" {
+			fmt.Printf("  digest:     %s\n", truncateDigest(state.Deploy.DeployedDigest))
+		}
+		if state.Deploy.DeployTime != nil {
+			fmt.Printf("  deployed:   %s\n", state.Deploy.DeployTime.Format("2006-01-02 15:04"))
+		}
+
+		// Live verification
+		drift, err := state.CheckDrift()
+		if err == nil && drift.Deployed {
+			if drift.DeployStale {
+				fmt.Printf("  status:     STALE (rebuilt since last deploy)\n")
+			} else if drift.DigestMatch {
+				fmt.Printf("  status:     CURRENT (running matches deployed)\n")
+			} else {
+				fmt.Printf("  status:     DRIFT (running digest differs from deployed)\n")
+				fmt.Printf("  running:    %s\n", truncateDigest(drift.RunningDigest))
+			}
+		}
+	}
+
+	return nil
+}
+
+func statusFromConfig(name string, inst *Instance) error {
 	fmt.Printf("Instance: %s\n", name)
 	fmt.Printf("Status:   %s\n", inst.Status)
 	fmt.Printf("Description: %s\n\n", inst.Description)
@@ -43,58 +175,84 @@ func statusInstance(cfg *Config, name string) error {
 	for component, image := range inst.Images {
 		fmt.Printf("  %-10s %s\n", component, image)
 	}
-
-	if inst.Deploy != nil {
-		fmt.Printf("\nDeploy target: context=%s deployment=%s\n",
-			inst.Deploy.KubeContext, inst.Deploy.EPPDeployment)
-	}
-
+	fmt.Println("\n(no state file — run 'forge pipeline build' to start tracking)")
 	return nil
 }
 
 // syncAll syncs all active instances.
 func syncAll(cfg *Config) error {
-	for name, inst := range cfg.ActiveInstances() {
-		fmt.Printf("=== Syncing %s\n", name)
-		if err := syncInstanceRepos(inst); err != nil {
-			fmt.Fprintf(os.Stderr, "  error syncing %s: %v\n", name, err)
+	states, _ := ListStates()
+	for _, state := range states {
+		if state.Status != "active" {
+			continue
+		}
+		fmt.Printf("=== Syncing %s\n", state.Name)
+		if err := syncState(state); err != nil {
+			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
 		}
 	}
 	return nil
 }
 
-// syncInstance syncs one instance's branches to forks.
+// syncInstance syncs one instance.
 func syncInstance(cfg *Config, name string) error {
-	inst, err := cfg.GetInstance(name)
+	state, err := LoadState(name)
 	if err != nil {
-		return err
+		// Fall back to config-based sync
+		inst, instErr := cfg.GetInstance(name)
+		if instErr != nil {
+			return instErr
+		}
+		return syncFromConfig(inst)
 	}
-	return syncInstanceRepos(inst)
+	return syncState(state)
 }
 
-func syncInstanceRepos(inst *Instance) error {
-	for repoName, repo := range inst.Repos {
-		localPath := repo.Local
-		if _, err := os.Stat(localPath); os.IsNotExist(err) {
-			fmt.Printf("  SKIP: %s not cloned at %s\n", repoName, localPath)
+func syncState(state *InstanceState) error {
+	for repoName, repo := range state.Repos {
+		if _, err := os.Stat(repo.Local); os.IsNotExist(err) {
+			fmt.Printf("  SKIP: %s not cloned\n", repoName)
 			continue
 		}
 
-		currentBranch, _, _ := repoState(localPath)
+		currentBranch, _, _ := repoState(repo.Local)
 		if currentBranch != repo.Branch {
 			fmt.Printf("  SKIP: %s on %q, expected %q\n", repoName, currentBranch, repo.Branch)
 			continue
 		}
 
 		fmt.Printf("  Pushing %s -> origin/%s\n", repoName, repo.Branch)
-		if err := gitPush(localPath, repo.Branch); err != nil {
+		if err := gitPush(repo.Local, repo.Branch); err != nil {
+			return fmt.Errorf("pushing %s: %w", repoName, err)
+		}
+
+		// Update sync state
+		now := time.Now()
+		repo.LastSyncCommit = getHeadCommit(repo.Local)
+		repo.LastSyncTime = &now
+	}
+
+	return SaveState(state)
+}
+
+func syncFromConfig(inst *Instance) error {
+	for repoName, repo := range inst.Repos {
+		if _, err := os.Stat(repo.Local); os.IsNotExist(err) {
+			continue
+		}
+		currentBranch, _, _ := repoState(repo.Local)
+		if currentBranch != repo.Branch {
+			continue
+		}
+		fmt.Printf("  Pushing %s -> origin/%s\n", repoName, repo.Branch)
+		if err := gitPush(repo.Local, repo.Branch); err != nil {
 			return fmt.Errorf("pushing %s: %w", repoName, err)
 		}
 	}
 	return nil
 }
 
-// buildInstance builds container images for an instance.
+// buildInstance builds container images and records state.
 func buildInstance(cfg *Config, name string) error {
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
@@ -106,41 +264,52 @@ func buildInstance(cfg *Config, name string) error {
 		return fmt.Errorf("instance %q has no 'epp' image defined", name)
 	}
 
-	// Find the scheduler repo (the one that builds the EPP binary)
 	schedulerRepo, ok := inst.Repos["llm-d-inference-scheduler"]
 	if !ok {
 		return fmt.Errorf("instance %q has no llm-d-inference-scheduler repo", name)
 	}
 
-	// Check if we need a multi-repo build (replace directive exists)
-	hasReplace := false
-	for _, rd := range inst.ReplaceDirectives {
-		if rd.Source == "llm-d-inference-scheduler" {
-			hasReplace = true
-			break
-		}
-	}
+	hasReplace := len(inst.ReplaceDirectives) > 0
 
 	if hasReplace {
-		return buildWithReplace(inst, schedulerRepo, eppImage)
+		err = buildWithReplace(inst, schedulerRepo, eppImage)
+	} else {
+		err = buildStandalone(schedulerRepo, eppImage)
 	}
-	return buildStandalone(schedulerRepo, eppImage)
+	if err != nil {
+		return err
+	}
+
+	// Record build state
+	state := loadOrInitState(name, inst)
+	now := time.Now()
+	digest, _ := getImageDigest(eppImage)
+
+	buildCommits := make(map[string]string)
+	for repoName, repo := range inst.Repos {
+		buildCommits[repoName] = getHeadCommit(repo.Local)
+	}
+
+	state.Images["epp"] = &ImageState{
+		Tag:          eppImage,
+		Digest:       digest,
+		BuildTime:    &now,
+		BuildCommits: buildCommits,
+		Pushed:       false,
+	}
+
+	return SaveState(state)
 }
 
 func buildWithReplace(inst *Instance, schedulerRepo *RepoConfig, imageTag string) error {
-	// When a replace directive exists, the Dockerfile needs both repos
-	// in the build context. Build from the parent directory with a
-	// multi-repo Dockerfile.
-	parentDir := filepath.Dir(schedulerRepo.Local)
+	parentDir := findCommonParent(inst)
 
-	// Verify all referenced repos exist
 	for repoName, repo := range inst.Repos {
 		if _, err := os.Stat(repo.Local); os.IsNotExist(err) {
 			return fmt.Errorf("repo %s not found at %s", repoName, repo.Local)
 		}
 	}
 
-	// Write a temporary multi-repo Dockerfile
 	dockerfile := `FROM quay.io/projectquay/golang:1.25 AS go-builder
 ARG LDFLAGS="-s -w"
 WORKDIR /workspace
@@ -161,13 +330,10 @@ ENTRYPOINT ["/app/epp"]
 `
 	tmpFile, err := os.CreateTemp("", "Dockerfile.forge-*.tmp")
 	if err != nil {
-		return fmt.Errorf("creating temp dockerfile: %w", err)
+		return err
 	}
 	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.WriteString(dockerfile); err != nil {
-		return fmt.Errorf("writing temp dockerfile: %w", err)
-	}
+	tmpFile.WriteString(dockerfile)
 	tmpFile.Close()
 
 	fmt.Printf("Building %s (multi-repo, context: %s)\n", imageTag, parentDir)
@@ -179,7 +345,7 @@ func buildStandalone(schedulerRepo *RepoConfig, imageTag string) error {
 	return runCmd(schedulerRepo.Local, "podman", "build", "-t", imageTag, "-f", "Dockerfile.epp", ".")
 }
 
-// pushInstance pushes container images for an instance.
+// pushInstance pushes images and records state.
 func pushInstance(cfg *Config, name string) error {
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
@@ -192,10 +358,22 @@ func pushInstance(cfg *Config, name string) error {
 	}
 
 	fmt.Printf("Pushing %s\n", eppImage)
-	return runCmd(".", "podman", "push", eppImage)
+	if err := runCmd(".", "podman", "push", eppImage); err != nil {
+		return err
+	}
+
+	// Update state
+	state := loadOrInitState(name, inst)
+	if img, ok := state.Images["epp"]; ok {
+		now := time.Now()
+		img.PushTime = &now
+		img.Pushed = true
+	}
+
+	return SaveState(state)
 }
 
-// deployInstance deploys the instance's EPP image to a cluster.
+// deployInstance deploys and records state with digest for verification.
 func deployInstance(cfg *Config, name string) error {
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
@@ -209,7 +387,6 @@ func deployInstance(cfg *Config, name string) error {
 
 	deploy := inst.Deploy
 	if deploy == nil {
-		// Defaults for the lab cluster
 		deploy = &DeployConfig{
 			KubeContext:   "labctl-endor",
 			Namespace:     "default",
@@ -219,19 +396,96 @@ func deployInstance(cfg *Config, name string) error {
 
 	fmt.Printf("Deploying %s to %s/%s\n", eppImage, deploy.KubeContext, deploy.EPPDeployment)
 
+	// Annotate the deployment with forge metadata
+	annotations := fmt.Sprintf("forge.hexfusion.io/instance=%s,forge.hexfusion.io/deployed-at=%s",
+		name, time.Now().Format(time.RFC3339))
+
 	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
-		"set", "image", "deployment/"+deploy.EPPDeployment,
-		"epp="+eppImage, "-n", deploy.Namespace); err != nil {
+		"-n", deploy.Namespace, "annotate", "deployment/"+deploy.EPPDeployment,
+		annotations, "--overwrite"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to annotate deployment: %v\n", err)
+	}
+
+	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+		"-n", deploy.Namespace, "set", "image",
+		"deployment/"+deploy.EPPDeployment, "epp="+eppImage); err != nil {
 		return err
 	}
 
 	fmt.Println("Waiting for rollout...")
-	return runCmd(".", "kubectl", "--context", deploy.KubeContext,
-		"rollout", "status", "deployment/"+deploy.EPPDeployment,
-		"-n", deploy.Namespace, "--timeout=120s")
+	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+		"-n", deploy.Namespace, "rollout", "status",
+		"deployment/"+deploy.EPPDeployment, "--timeout=120s"); err != nil {
+		return err
+	}
+
+	// Record deploy state
+	state := loadOrInitState(name, inst)
+	now := time.Now()
+	digest := ""
+	if img, ok := state.Images["epp"]; ok {
+		digest = img.Digest
+	}
+
+	deployCommits := make(map[string]string)
+	for repoName, repo := range inst.Repos {
+		deployCommits[repoName] = getHeadCommit(repo.Local)
+	}
+
+	state.Deploy = &DeployState{
+		KubeContext:    deploy.KubeContext,
+		Namespace:      deploy.Namespace,
+		Deployment:     deploy.EPPDeployment,
+		DeployedDigest: digest,
+		DeployTime:     &now,
+		DeployCommits:  deployCommits,
+	}
+
+	return SaveState(state)
 }
 
 // --- helpers ---
+
+func loadOrInitState(name string, inst *Instance) *InstanceState {
+	state, err := LoadState(name)
+	if err == nil {
+		return state
+	}
+
+	// Initialize from config
+	now := time.Now()
+	repos := make(map[string]*RepoState)
+	for repoName, repo := range inst.Repos {
+		repos[repoName] = &RepoState{
+			Fork:   repo.Fork,
+			Branch: repo.Branch,
+			Local:  repo.Local,
+		}
+	}
+
+	return &InstanceState{
+		Name:              name,
+		Status:            inst.Status,
+		Description:       inst.Description,
+		Created:           now,
+		Repos:             repos,
+		Images:            make(map[string]*ImageState),
+		ReplaceDirectives: inst.ReplaceDirectives,
+		Proposal:          inst.Proposal,
+	}
+}
+
+func findCommonParent(inst *Instance) string {
+	// Find the common parent directory of all repos
+	for _, repo := range inst.Repos {
+		// Assume all repos are siblings under the same parent
+		parts := strings.Split(repo.Local, "/")
+		if len(parts) > 1 {
+			return strings.Join(parts[:len(parts)-1], "/")
+		}
+	}
+	return "."
+}
 
 func repoState(localPath string) (branch string, dirty bool, commit string) {
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
@@ -242,13 +496,13 @@ func repoState(localPath string) (branch string, dirty bool, commit string) {
 	if err != nil {
 		return "(unknown)", false, ""
 	}
-	branch = strings.TrimSpace(out)
+	branch = trimSpace(out)
 
 	out, _ = cmdOutput(localPath, "git", "status", "--porcelain")
-	dirty = strings.TrimSpace(out) != ""
+	dirty = trimSpace(out) != ""
 
 	out, _ = cmdOutput(localPath, "git", "log", "--oneline", "-1")
-	commit = strings.TrimSpace(out)
+	commit = trimSpace(out)
 
 	return branch, dirty, commit
 }
@@ -270,4 +524,11 @@ func cmdOutput(dir string, name string, args ...string) (string, error) {
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	return string(out), err
+}
+
+func truncateDigest(digest string) string {
+	if len(digest) > 19 {
+		return digest[:19] + "..."
+	}
+	return digest
 }
