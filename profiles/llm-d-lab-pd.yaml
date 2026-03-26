@@ -1,0 +1,69 @@
+# llm-d Lab — Disaggregated P/D Profile
+#
+# Full stack deployment for the 2-node lab cluster (endor + host-vm).
+# Components are deployed in order. Pipeline-built images are injected
+# where image_override is specified.
+#
+# Usage:
+#   forge pipeline deploy orca-metrics --profile llm-d-lab-pd
+
+name: llm-d-lab-pd
+kube_context: labctl-endor
+namespace: default
+
+components:
+  # 1. CRDs and gateway infrastructure
+  - name: agentgateway
+    type: helm
+    chart: oci://cr.agentgateway.dev/charts/agentgateway
+    helm_set:
+      gatewayClass.controllerName: "agentgateway.dev/agentgateway"
+    wait_ready: true
+
+  # 2. Gateway instance
+  - name: inference-gateway
+    type: manifest
+    manifest_path: manifests/gateway.yaml
+    depends_on: [agentgateway]
+    wait_ready: true
+
+  # 3. RDMA device plugin (both nodes)
+  - name: rdma-device-plugin
+    type: manifest
+    manifest_path: manifests/rdma-device-plugin.yaml
+
+  # 4. Model servers (P/D disaggregated)
+  - name: vllm-decode
+    type: manifest
+    manifest_path: manifests/vllm-pd.yaml
+    image_override:
+      pipeline_image: vllm
+      container_name: vllm
+    depends_on: [rdma-device-plugin]
+    wait_ready: true
+
+  - name: vllm-prefill
+    type: manifest
+    manifest_path: manifests/vllm-pd.yaml
+    image_override:
+      pipeline_image: vllm
+      container_name: vllm
+    depends_on: [rdma-device-plugin]
+    wait_ready: true
+
+  # 5. EPP (endpoint picker) with inference pool
+  - name: vllm-pool-epp
+    type: helm
+    chart: oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool
+    chart_version: v1.3.1
+    values_file: values/epp-pd.yaml
+    image_override:
+      pipeline_image: epp
+      helm_value: inferenceExtension.image
+    depends_on: [inference-gateway, vllm-decode]
+    wait_ready: true
+
+  # 6. Monitoring
+  - name: monitoring
+    type: manifest
+    manifest_path: manifests/monitoring.yaml

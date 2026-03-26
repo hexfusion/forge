@@ -444,6 +444,52 @@ func deployInstance(cfg *Config, name string) error {
 	return SaveState(state)
 }
 
+// deployWithProfile deploys a full stack using a deploy profile.
+func deployWithProfile(cfg *Config, name, profileName string) error {
+	inst, err := cfg.GetInstance(name)
+	if err != nil {
+		return err
+	}
+
+	profile, err := LoadDeployProfile(profileName)
+	if err != nil {
+		return err
+	}
+
+	// Load instance state to get built image info
+	state := loadOrInitState(name, inst)
+
+	fmt.Printf("Deploying full stack: profile=%s instance=%s cluster=%s\n\n",
+		profileName, name, profile.KubeContext)
+
+	if err := DeployStack(profile, state.Images); err != nil {
+		return err
+	}
+
+	// Record deploy state
+	now := time.Now()
+	digest := ""
+	if img, ok := state.Images["epp"]; ok {
+		digest = img.Digest
+	}
+
+	deployCommits := make(map[string]string)
+	for repoName, repo := range inst.Repos {
+		deployCommits[repoName] = getHeadCommit(repo.Local)
+	}
+
+	state.Deploy = &DeployState{
+		KubeContext:    profile.KubeContext,
+		Namespace:      profile.Namespace,
+		Deployment:     "vllm-pool-epp",
+		DeployedDigest: digest,
+		DeployTime:     &now,
+		DeployCommits:  deployCommits,
+	}
+
+	return SaveState(state)
+}
+
 // --- helpers ---
 
 func loadOrInitState(name string, inst *Instance) *InstanceState {

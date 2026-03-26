@@ -99,18 +99,30 @@ func newPushCommand() *cobra.Command {
 }
 
 func newDeployCommand() *cobra.Command {
-	return &cobra.Command{
+	var profile string
+
+	cmd := &cobra.Command{
 		Use:   "deploy <instance>",
 		Short: "Deploy instance images to lab cluster",
-		Args:  cobra.ExactArgs(1),
+		Long: `Deploy instance images to a cluster. Without --profile, updates only the
+EPP deployment image. With --profile, deploys the full stack using the
+named deploy profile (e.g., llm-d-lab-pd).`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := LoadConfig("")
 			if err != nil {
 				return err
 			}
+
+			if profile != "" {
+				return deployWithProfile(cfg, args[0], profile)
+			}
 			return deployInstance(cfg, args[0])
 		},
 	}
+
+	cmd.Flags().StringVar(&profile, "profile", "", "deploy profile for full stack deployment (e.g., llm-d-lab-pd)")
+	return cmd
 }
 
 func newShipCommand() *cobra.Command {
