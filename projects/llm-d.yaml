@@ -1,0 +1,79 @@
+# llm-d Project Graph
+#
+# Defines the dependency graph for the llm-d ecosystem. When creating a
+# new pipeline instance, forge walks this graph to auto-resolve replace
+# directives, image tags, and which repos need branches.
+#
+# Usage:
+#   forge pipeline create my-feature --project llm-d --repos gateway-api-inference-extension,llm-d-inference-scheduler
+
+name: llm-d
+
+repos:
+  gateway-api-inference-extension:
+    upstream: kubernetes-sigs/gateway-api-inference-extension
+    fork: hexfusion/gateway-api-inference-extension
+    module: sigs.k8s.io/gateway-api-inference-extension
+    local: ~/projects/llm-d/gateway-api-inference-extension
+
+  llm-d-inference-scheduler:
+    upstream: llm-d/llm-d-inference-scheduler
+    fork: hexfusion/llm-d-inference-scheduler
+    module: github.com/llm-d/llm-d-inference-scheduler
+    local: ~/projects/llm-d/llm-d-inference-scheduler
+    images:
+      epp:
+        dockerfile: Dockerfile.epp
+        registry: quay.io:443/sbatsche
+        name_override: llm-d-epp
+
+  llm-d-kv-cache:
+    upstream: llm-d/llm-d-kv-cache
+    fork: hexfusion/llm-d-kv-cache
+    module: github.com/llm-d/llm-d-kv-cache
+    local: ~/projects/llm-d/llm-d-kv-cache
+
+  llm-d-inference-sim:
+    upstream: llm-d/llm-d-inference-sim
+    fork: hexfusion/llm-d-inference-sim
+    module: github.com/llm-d/llm-d-inference-sim
+    local: ~/projects/llm-d/llm-d-inference-sim
+
+  vllm:
+    upstream: vllm-project/vllm
+    fork: hexfusion/vllm
+    local: ~/projects/hexfusion/vllm-cuda13
+    images:
+      vllm:
+        dockerfile: Containerfile
+        registry: quay.io:443/sbatsche
+        name_override: vllm-cuda
+
+# Dependency graph — edges between repos
+#
+# go-module: A imports B. When both are in an instance, forge injects
+#            a replace directive in A's go.mod pointing to local B.
+# build:     A's image depends on B's source. If B is modified,
+#            A's image needs rebuilding.
+dependencies:
+  # Scheduler imports GIE framework
+  - from: llm-d-inference-scheduler
+    to: gateway-api-inference-extension
+    type: go-module
+
+  # Scheduler imports KV cache library
+  - from: llm-d-inference-scheduler
+    to: llm-d-kv-cache
+    type: go-module
+
+  # Sim imports GIE for test types
+  - from: llm-d-inference-sim
+    to: gateway-api-inference-extension
+    type: go-module
+
+defaults:
+  image_registry: quay.io:443/sbatsche
+  deploy:
+    kube_context: labctl-endor
+    namespace: default
+    epp_deployment: vllm-pool-epp
