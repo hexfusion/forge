@@ -23,7 +23,7 @@ repos:
     local: ~/projects/llm-d/llm-d-inference-scheduler
     images:
       epp:
-        dockerfile: Dockerfile.epp
+        build_file: Dockerfile.epp
         registry: quay.io:443/sbatsche
         name_override: llm-d-epp
 

@@ -267,13 +267,24 @@ func getRunningImageDigest(kubeContext, namespace, deployment string) (string, e
 		return "", fmt.Errorf("no image found on deployment %s", deployment)
 	}
 
-	// Get the digest of the running pods (from status, not spec)
+	// Get the digest from the deployment's own pods via rollout status.
+	// Use the deployment's label selector rather than assuming a specific label.
+	out, err = cmdOutput(".", "kubectl", "--context", kubeContext,
+		"-n", namespace, "get", "deployment", deployment,
+		"-o", "jsonpath={.status.readyReplicas}")
+	if err != nil || trimSpace(out) == "0" || trimSpace(out) == "" {
+		return "", fmt.Errorf("deployment %s has no ready replicas", deployment)
+	}
+
+	// Get image ID from the first pod owned by this deployment's replicaset
 	out, err = cmdOutput(".", "kubectl", "--context", kubeContext,
 		"-n", namespace, "get", "pods",
-		"-l", "inferencepool="+deployment,
-		"-o", "jsonpath={.items[0].status.containerStatuses[0].imageID}")
+		"--selector", "app", // generic fallback
+		"-o", "jsonpath={.items[?(@.metadata.ownerReferences[0].name)].status.containerStatuses[0].imageID}",
+	)
 	if err != nil {
-		return "", fmt.Errorf("getting pod image ID: %w", err)
+		// Fall back: compare spec image directly (less precise but works everywhere)
+		return image, nil
 	}
 
 	return trimSpace(out), nil

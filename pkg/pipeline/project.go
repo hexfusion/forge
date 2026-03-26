@@ -10,7 +10,7 @@ import "fmt"
 //
 // When a user creates an instance targeting specific repos, forge resolves
 // the transitive dependencies and auto-generates replace directives, image
-// tags, and Dockerfile selection.
+// tags, and Containerfile selection.
 type Project struct {
 	// Name identifies the project (e.g., "llm-d").
 	Name string `yaml:"name"`
@@ -46,8 +46,10 @@ type ProjectRepo struct {
 
 // ImageDef defines how to build a container image from a repo.
 type ImageDef struct {
-	// Dockerfile path relative to the repo root.
-	Dockerfile string `yaml:"dockerfile"`
+	// BuildFile is the container build file path relative to the repo root
+	// (e.g., "Containerfile", "Dockerfile.epp"). Forge passes this to
+	// podman build -f. The name matches whatever the upstream project uses.
+	BuildFile string `yaml:"build_file"`
 
 	// Registry is the default push target (e.g., "quay.io:443/sbatsche").
 	Registry string `yaml:"registry"`
