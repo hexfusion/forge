@@ -1,0 +1,44 @@
+# Monitoring Stack — Lab Profile
+#
+# Deploys alongside the application stack. Provides the data collection
+# layer for forge pipeline bench/compare.
+#
+# Usage:
+#   forge pipeline deploy orca-metrics --profile llm-d-lab-pd
+#   forge monitor deploy lab            # deploys this monitoring stack
+#   forge pipeline bench orca-metrics   # runs workload, captures snapshot
+
+name: monitoring-lab
+kube_context: labctl-endor
+namespace: monitoring
+
+components:
+  # Prometheus — already deployed, included for completeness
+  - name: prometheus
+    type: manifest
+    manifest_path: manifests/prometheus.yaml
+    wait_ready: true
+
+  # Grafana — already deployed
+  - name: grafana
+    type: manifest
+    manifest_path: manifests/grafana.yaml
+    depends_on: [prometheus]
+
+  # OTel Collector — receives traces from EPP, forwards to Jaeger
+  - name: otel-collector
+    type: manifest
+    manifest_path: manifests/otel-collector.yaml
+    wait_ready: true
+
+  # Jaeger — trace storage and UI
+  - name: jaeger
+    type: manifest
+    manifest_path: manifests/jaeger.yaml
+    depends_on: [otel-collector]
+    wait_ready: true
+
+  # Node exporter — already deployed
+  - name: node-exporter
+    type: manifest
+    manifest_path: manifests/node-exporter.yaml
