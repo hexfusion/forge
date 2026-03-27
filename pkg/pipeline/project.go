@@ -60,8 +60,24 @@ type ImageDef struct {
 	// Registry is the default push target (e.g., "quay.io:443/sbatsche").
 	Registry string `yaml:"registry"`
 
-	// NameOverride overrides the image name (default: repo name).
+	// NameOverride overrides the image name (default: image key name).
 	NameOverride string `yaml:"name_override,omitempty"`
+
+	// BuildTarget is the Go build target for generated Containerfiles
+	// (e.g., "cmd/epp/main.go"). If empty, defaults to "cmd/<imgName>/main.go".
+	BuildTarget string `yaml:"build_target,omitempty"`
+
+	// BinaryName is the output binary name (e.g., "epp").
+	// If empty, defaults to the image key name.
+	BinaryName string `yaml:"binary_name,omitempty"`
+
+	// BuilderBase is the builder stage base image.
+	// If empty, defaults to "quay.io/projectquay/golang:1.25".
+	BuilderBase string `yaml:"builder_base,omitempty"`
+
+	// RuntimeBase is the runtime stage base image.
+	// If empty, defaults to "registry.access.redhat.com/ubi9/ubi-micro:9.7".
+	RuntimeBase string `yaml:"runtime_base,omitempty"`
 }
 
 // Dependency is an edge in the project graph.
@@ -154,7 +170,7 @@ func (p *Project) ResolveInstance(name string, targetRepos []string) (*Instance,
 			}
 			imageName := imgDef.NameOverride
 			if imageName == "" {
-				imageName = "llm-d-" + imgName
+				imageName = imgName
 			}
 			images[imgName] = fmt.Sprintf("%s/%s:%s", registry, imageName, name)
 		}
@@ -203,16 +219,13 @@ func LoadProject(name string) (*Project, error) {
 }
 
 func findProjectFile(name string) string {
+	home := mustHomeDir()
+
 	candidates := []string{
 		os.Getenv("FORGE_PROJECTS_DIR"),
-	}
-
-	// Look relative to the forge source checkout
-	home := mustHomeDir()
-	candidates = append(candidates,
-		filepath.Join(home, "projects", "hexfusion", "forge", "projects"),
 		filepath.Join(home, ".config", "forge", "projects"),
-	)
+		filepath.Join(home, "projects", "hexfusion", "forge", "projects"),
+	}
 
 	for _, dir := range candidates {
 		if dir == "" {

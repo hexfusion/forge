@@ -25,51 +25,7 @@ type Instance struct {
 	Images            map[string]string      `yaml:"images"`
 	ReplaceDirectives []ReplaceDirective     `yaml:"replace_directives"`
 	Deploy            *DeployConfig          `yaml:"deploy,omitempty"`
-	Model             *ModelConfig           `yaml:"model,omitempty"`
-	Bench             *BenchConfig           `yaml:"bench,omitempty"`
 	Proposal          string                 `yaml:"proposal,omitempty"`
-}
-
-// ModelConfig defines the model serving target for this instance.
-type ModelConfig struct {
-	// Name is the model identifier used in API requests (e.g., "Qwen/Qwen2.5-7B-Instruct-AWQ").
-	Name string `yaml:"name"`
-
-	// Quantization is the quantization method (e.g., "awq", "gptq", "fp16").
-	Quantization string `yaml:"quantization,omitempty"`
-
-	// MaxModelLen is the maximum context length.
-	MaxModelLen int `yaml:"max_model_len,omitempty"`
-
-	// Source is where the model weights come from (e.g., HuggingFace repo, S3 path).
-	Source string `yaml:"source,omitempty"`
-}
-
-// BenchConfig defines how to benchmark this instance.
-type BenchConfig struct {
-	// Workload is the benchmark workload type (e.g., "burst", "sustained", "mixed").
-	Workload string `yaml:"workload"`
-
-	// Concurrency is the number of concurrent requests.
-	Concurrency int `yaml:"concurrency"`
-
-	// TotalRequests is the total number of requests to send.
-	TotalRequests int `yaml:"total_requests"`
-
-	// PromptTemplate is the prompt format for the workload.
-	PromptTemplate string `yaml:"prompt_template,omitempty"`
-
-	// MaxTokens is the max tokens per request.
-	MaxTokens int `yaml:"max_tokens"`
-
-	// Stream controls whether to use streaming responses.
-	Stream bool `yaml:"stream"`
-
-	// Duration is the benchmark duration for sustained workloads (e.g., "60s", "5m").
-	Duration string `yaml:"duration,omitempty"`
-
-	// GatewayEndpoint overrides the gateway URL (default: auto-discover from cluster).
-	GatewayEndpoint string `yaml:"gateway_endpoint,omitempty"`
 }
 
 // RepoConfig tracks a single repo's branch and fork within an instance.

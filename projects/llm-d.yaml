@@ -26,6 +26,10 @@ repos:
         build_file: Dockerfile.epp
         registry: quay.io:443/sbatsche
         name_override: llm-d-epp
+        build_target: cmd/epp/main.go
+        binary_name: epp
+        builder_base: quay.io/projectquay/golang:1.25
+        runtime_base: registry.access.redhat.com/ubi9/ubi-micro:9.7
 
   llm-d-kv-cache:
     upstream: llm-d/llm-d-kv-cache

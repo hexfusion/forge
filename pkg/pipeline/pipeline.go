@@ -31,8 +31,6 @@ func NewCommand() *cobra.Command {
 	cmd.AddCommand(newPushCommand())
 	cmd.AddCommand(newDeployCommand())
 	cmd.AddCommand(newShipCommand())
-	cmd.AddCommand(newBenchCommand())
-	cmd.AddCommand(newCompareCommand())
 
 	return cmd
 }
@@ -234,29 +232,3 @@ func newShipCommand() *cobra.Command {
 	}
 }
 
-func newBenchCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "bench <instance>",
-		Short: "Run benchmark workload and capture performance snapshot",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := LoadConfig("")
-			if err != nil {
-				return err
-			}
-			_, err = RunBench(cfg, args[0])
-			return err
-		},
-	}
-}
-
-func newCompareCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "compare <instance>",
-		Short: "Compare the two most recent benchmark snapshots",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return CompareSnapshots(args[0])
-		},
-	}
-}

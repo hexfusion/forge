@@ -45,16 +45,6 @@ instances:
       kube_context: my-cluster
       namespace: default
       epp_deployment: my-epp
-    model:
-      name: Qwen/Qwen2.5-7B
-      quantization: awq
-      max_model_len: 1024
-    bench:
-      workload: burst
-      concurrency: 50
-      total_requests: 200
-      max_tokens: 64
-      stream: false
     proposal: path/to/PROPOSAL.md
 `,
 			wantInstances: 1,
@@ -70,12 +60,6 @@ instances:
 				}
 				if inst.Deploy == nil || inst.Deploy.KubeContext != "my-cluster" {
 					t.Error("deploy config not loaded")
-				}
-				if inst.Model == nil || inst.Model.Name != "Qwen/Qwen2.5-7B" {
-					t.Error("model config not loaded")
-				}
-				if inst.Bench == nil || inst.Bench.Concurrency != 50 {
-					t.Error("bench config not loaded")
 				}
 				if inst.Proposal != "path/to/PROPOSAL.md" {
 					t.Errorf("proposal = %q", inst.Proposal)
@@ -109,12 +93,6 @@ instances:
 			checkInstance: func(t *testing.T, inst *Instance) {
 				if inst.Deploy != nil {
 					t.Error("expected nil deploy")
-				}
-				if inst.Model != nil {
-					t.Error("expected nil model")
-				}
-				if inst.Bench != nil {
-					t.Error("expected nil bench")
 				}
 				if len(inst.Repos) != 0 {
 					t.Errorf("repos = %d, want 0", len(inst.Repos))
@@ -313,11 +291,6 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 					Namespace:     "ns",
 					EPPDeployment: "epp",
 				},
-				Model: &ModelConfig{
-					Name:         "model-name",
-					Quantization: "awq",
-					MaxModelLen:  2048,
-				},
 				Proposal: "path/to/PROPOSAL.md",
 			},
 		},
@@ -353,9 +326,6 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 	}
 	if inst.Deploy == nil || inst.Deploy.KubeContext != "ctx" {
 		t.Error("deploy not preserved")
-	}
-	if inst.Model == nil || inst.Model.Name != "model-name" {
-		t.Error("model not preserved")
 	}
 	if inst.Proposal != "path/to/PROPOSAL.md" {
 		t.Error("proposal not preserved")

@@ -81,7 +81,12 @@ func statusInstanceYAML(cfg *Config, name string) error {
 		return err
 	}
 
-	out := map[string]any{name: inst}
+	out := map[string]any{
+		name: inst,
+		"_meta": map[string]string{
+			"config_path": cfg.path,
+		},
+	}
 	data, err := yaml.Marshal(out)
 	if err != nil {
 		return fmt.Errorf("marshaling instance: %w", err)
@@ -247,7 +252,9 @@ func createInstance(projectName, instanceName, description string, targetRepos [
 
 		// Fetch latest from upstream before branching
 		fmt.Printf("    fetching upstream...\n")
-		_ = runCmd(mainLocal, "git", "fetch", "upstream")
+		if err := runCmd(mainLocal, "git", "fetch", "upstream"); err != nil {
+			fmt.Fprintf(os.Stderr, "    warning: upstream fetch failed: %v (using cached code)\n", err)
+		}
 
 		// Create the worktree with a new branch from upstream/main
 		if err := runCmd(mainLocal, "git", "worktree", "add",
@@ -512,14 +519,14 @@ func syncInstance(cfg *Config, name string) error {
 }
 
 func syncState(state *InstanceState) error {
+	var skipped []string
 	for repoName, repo := range state.Repos {
 		if _, err := os.Stat(repo.Local); os.IsNotExist(err) {
-			fmt.Printf("  SKIP: %s not cloned\n", repoName)
-			continue
+			return fmt.Errorf("repo %s: directory not found at %s", repoName, repo.Local)
 		}
 		currentBranch, _, _ := repoState(repo.Local)
 		if currentBranch != repo.Branch {
-			fmt.Printf("  SKIP: %s on %q, expected %q\n", repoName, currentBranch, repo.Branch)
+			skipped = append(skipped, fmt.Sprintf("%s (on %q, expected %q)", repoName, currentBranch, repo.Branch))
 			continue
 		}
 		fmt.Printf("  Pushing %s -> origin/%s\n", repoName, repo.Branch)
@@ -530,22 +537,33 @@ func syncState(state *InstanceState) error {
 		repo.LastSyncCommit = getHeadCommit(repo.Local)
 		repo.LastSyncTime = &now
 	}
-	return SaveState(state)
+	if err := SaveState(state); err != nil {
+		return err
+	}
+	if len(skipped) > 0 {
+		return fmt.Errorf("skipped repos (wrong branch): %s", strings.Join(skipped, ", "))
+	}
+	return nil
 }
 
 func syncFromConfig(inst *Instance) error {
+	var skipped []string
 	for repoName, repo := range inst.Repos {
 		if _, err := os.Stat(repo.Local); os.IsNotExist(err) {
-			continue
+			return fmt.Errorf("repo %s: directory not found at %s", repoName, repo.Local)
 		}
 		currentBranch, _, _ := repoState(repo.Local)
 		if currentBranch != repo.Branch {
+			skipped = append(skipped, fmt.Sprintf("%s (on %q, expected %q)", repoName, currentBranch, repo.Branch))
 			continue
 		}
 		fmt.Printf("  Pushing %s -> origin/%s\n", repoName, repo.Branch)
 		if err := gitPush(repo.Local, repo.Branch); err != nil {
 			return fmt.Errorf("pushing %s: %w", repoName, err)
 		}
+	}
+	if len(skipped) > 0 {
+		return fmt.Errorf("skipped repos (wrong branch): %s", strings.Join(skipped, ", "))
 	}
 	return nil
 }
@@ -570,7 +588,7 @@ func buildInstance(cfg *Config, name string) error {
 		fmt.Printf("=== Building image: %s (%s)\n", imgName, imageTag)
 
 		if hasReplace {
-			if err := buildWithReplace(inst, imageTag); err != nil {
+			if err := buildWithReplace(inst, imgName, imageTag); err != nil {
 				return fmt.Errorf("building %s: %w", imgName, err)
 			}
 		} else {
@@ -587,7 +605,10 @@ func buildInstance(cfg *Config, name string) error {
 		}
 
 		now := time.Now()
-		digest, _ := getImageDigest(imageTag)
+		digest, err := getImageDigest(imageTag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not retrieve digest for %s: %v\n", imageTag, err)
+		}
 		buildCommits := collectCommits(inst)
 
 		state.Images[imgName] = &ImageState{
@@ -602,7 +623,7 @@ func buildInstance(cfg *Config, name string) error {
 	return SaveState(state)
 }
 
-func buildWithReplace(inst *Instance, imageTag string) error {
+func buildWithReplace(inst *Instance, imgName, imageTag string) error {
 	parentDir := findCommonParent(inst)
 
 	for repoName, repo := range inst.Repos {
@@ -632,9 +653,29 @@ func buildWithReplace(inst *Instance, imageTag string) error {
 		}
 	}
 
+	// Build config — use defaults if not configured
+	builderBase := "quay.io/projectquay/golang:1.25"
+	runtimeBase := "registry.access.redhat.com/ubi9/ubi-micro:9.7"
+	buildTarget := fmt.Sprintf("cmd/%s/main.go", imgName)
+	binaryName := imgName
+
+	// Override from env if set (until project graph is threaded through)
+	if v := os.Getenv("FORGE_BUILDER_BASE"); v != "" {
+		builderBase = v
+	}
+	if v := os.Getenv("FORGE_RUNTIME_BASE"); v != "" {
+		runtimeBase = v
+	}
+	if v := os.Getenv("FORGE_BUILD_TARGET"); v != "" {
+		buildTarget = v
+	}
+	if v := os.Getenv("FORGE_BINARY_NAME"); v != "" {
+		binaryName = v
+	}
+
 	// Generate Containerfile dynamically based on instance repos
 	var df strings.Builder
-	df.WriteString("FROM quay.io/projectquay/golang:1.25 AS go-builder\n")
+	df.WriteString(fmt.Sprintf("FROM %s AS go-builder\n", builderBase))
 	df.WriteString("ARG LDFLAGS=\"-s -w\"\n")
 	df.WriteString("WORKDIR /workspace\n")
 
@@ -656,13 +697,12 @@ func buildWithReplace(inst *Instance, imageTag string) error {
 		}
 	}
 
-	df.WriteString("RUN CGO_ENABLED=0 go build -ldflags=\"${LDFLAGS}\" -o /workspace/bin/epp cmd/epp/main.go\n")
-	df.WriteString("FROM registry.access.redhat.com/ubi9/ubi-micro:9.7\n")
+	df.WriteString(fmt.Sprintf("RUN CGO_ENABLED=0 go build -ldflags=\"${LDFLAGS}\" -o /workspace/bin/%s %s\n", binaryName, buildTarget))
+	df.WriteString(fmt.Sprintf("FROM %s\n", runtimeBase))
 	df.WriteString("WORKDIR /\n")
-	df.WriteString("COPY --from=go-builder /workspace/bin/epp /app/epp\n")
+	df.WriteString(fmt.Sprintf("COPY --from=go-builder /workspace/bin/%s /app/%s\n", binaryName, binaryName))
 	df.WriteString("USER 65532:65532\n")
-	df.WriteString("EXPOSE 9002 9003 9090 5557\n")
-	df.WriteString("ENTRYPOINT [\"/app/epp\"]\n")
+	df.WriteString(fmt.Sprintf("ENTRYPOINT [\"/app/%s\"]\n", binaryName))
 
 	tmpFile, err := os.CreateTemp("", "Containerfile.forge-*.tmp")
 	if err != nil {
