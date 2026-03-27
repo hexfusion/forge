@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // statusAll prints a summary of all instances from the state store.
@@ -69,6 +72,22 @@ func statusInstance(cfg *Config, name string) error {
 		return err
 	}
 	return statusFromConfig(name, inst)
+}
+
+// statusInstanceYAML dumps the full instance config as YAML.
+func statusInstanceYAML(cfg *Config, name string) error {
+	inst, err := cfg.GetInstance(name)
+	if err != nil {
+		return err
+	}
+
+	out := map[string]any{name: inst}
+	data, err := yaml.Marshal(out)
+	if err != nil {
+		return fmt.Errorf("marshaling instance: %w", err)
+	}
+	fmt.Print(string(data))
+	return nil
 }
 
 func statusFromState(state *InstanceState) error {
@@ -172,6 +191,296 @@ func statusFromConfig(name string, inst *Instance) error {
 	}
 	fmt.Println("\n(no state file — run 'forge pipeline build' to start tracking)")
 	return nil
+}
+
+// --- create ---
+
+// createInstance creates a new pipeline instance from the project graph.
+// For each repo: creates a git worktree with a new feature branch.
+// Then writes the instance to the config file and creates initial state.
+func createInstance(projectName, instanceName, description string, targetRepos []string) error {
+	project, err := LoadProject(projectName)
+	if err != nil {
+		return err
+	}
+
+	// Check if instance already exists in config
+	cfg, cfgErr := LoadConfig("")
+	if cfgErr == nil {
+		if _, err := cfg.GetInstance(instanceName); err == nil {
+			return fmt.Errorf("instance %q already exists", instanceName)
+		}
+	}
+
+	// Resolve the instance from the project graph
+	inst, err := project.ResolveInstance(instanceName, targetRepos)
+	if err != nil {
+		return err
+	}
+	if description != "" {
+		inst.Description = description
+	}
+
+	// Create git worktrees for each repo
+	for repoName, repo := range inst.Repos {
+		pr := project.Repos[repoName]
+		mainLocal := expandHome(pr.Local)
+
+		// Verify main checkout exists
+		if _, err := os.Stat(mainLocal); os.IsNotExist(err) {
+			return fmt.Errorf("repo %s not cloned at %s", repoName, mainLocal)
+		}
+
+		worktreePath := repo.Local
+		fmt.Printf("  Creating worktree: %s\n", worktreePath)
+		fmt.Printf("    from: %s\n", mainLocal)
+		fmt.Printf("    branch: %s\n", repo.Branch)
+
+		// Create parent directory
+		if err := os.MkdirAll(worktreePath, 0755); err != nil {
+			return fmt.Errorf("creating worktree dir for %s: %w", repoName, err)
+		}
+		// Remove the empty dir — git worktree add needs a non-existent target
+		if err := os.Remove(worktreePath); err != nil {
+			return fmt.Errorf("removing placeholder dir for %s: %w", repoName, err)
+		}
+
+		// Fetch latest from upstream before branching
+		fmt.Printf("    fetching upstream...\n")
+		_ = runCmd(mainLocal, "git", "fetch", "upstream")
+
+		// Create the worktree with a new branch from upstream/main
+		if err := runCmd(mainLocal, "git", "worktree", "add",
+			"-b", repo.Branch, worktreePath, "upstream/main"); err != nil {
+			// Branch may already exist — try without -b
+			if err2 := runCmd(mainLocal, "git", "worktree", "add",
+				worktreePath, repo.Branch); err2 != nil {
+				return fmt.Errorf("creating worktree for %s: %w (also tried existing branch: %v)", repoName, err, err2)
+			}
+		}
+
+		fmt.Printf("    -> %s\n\n", worktreePath)
+	}
+
+	// Inject go.mod replace directives
+	for _, rd := range inst.ReplaceDirectives {
+		repo := inst.Repos[rd.Source]
+		if repo == nil {
+			continue
+		}
+		fmt.Printf("  Injecting replace: %s\n", rd.GoModLine)
+		parts := strings.SplitN(rd.GoModLine, " => ", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("malformed replace directive: %s", rd.GoModLine)
+		}
+		modulePath := strings.TrimPrefix(parts[0], "replace ")
+		localPath := parts[1]
+
+		if err := runCmd(repo.Local, "go", "mod", "edit",
+			"-replace", modulePath+"="+localPath); err != nil {
+			return fmt.Errorf("injecting replace for %s: %w", rd.Source, err)
+		}
+	}
+
+	// Write initial state
+	state := &InstanceState{
+		Name:              instanceName,
+		Project:           projectName,
+		Status:            "active",
+		Description:       inst.Description,
+		Created:           time.Now(),
+		Repos:             make(map[string]*RepoState),
+		Images:            make(map[string]*ImageState),
+		ReplaceDirectives: inst.ReplaceDirectives,
+		Proposal:          inst.Proposal,
+	}
+	for repoName, repo := range inst.Repos {
+		state.Repos[repoName] = &RepoState{
+			Fork:   repo.Fork,
+			Branch: repo.Branch,
+			Local:  repo.Local,
+		}
+	}
+	for imgName, imgTag := range inst.Images {
+		state.Images[imgName] = &ImageState{Tag: imgTag}
+	}
+	if inst.Deploy != nil {
+		state.Deploy = &DeployState{
+			KubeContext: inst.Deploy.KubeContext,
+			Namespace:   inst.Deploy.Namespace,
+			Deployment:  inst.Deploy.EPPDeployment,
+		}
+	}
+	if err := SaveState(state); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+
+	// Append to config file if we have one
+	if cfgErr == nil && cfg != nil {
+		cfg.Instances[instanceName] = inst
+		if err := SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not update config file: %v\n", err)
+		}
+	}
+
+	fmt.Printf("Instance %q created.\n", instanceName)
+	fmt.Printf("  Worktrees ready — cd into any repo and start coding.\n")
+	fmt.Printf("  Run 'forge pipeline status %s -o yaml' for full details.\n", instanceName)
+	return nil
+}
+
+// --- destroy ---
+
+// destroyInstance removes a pipeline instance: worktrees, state file, config entry.
+// Branches on the fork remote are preserved as the durable record.
+func destroyInstance(name string, force bool) error {
+	// Try to load state first (has the worktree paths)
+	state, stateErr := LoadState(name)
+
+	// Also try config
+	cfg, cfgErr := LoadConfig("")
+	var inst *Instance
+	if cfgErr == nil {
+		inst, _ = cfg.GetInstance(name)
+	}
+
+	if stateErr != nil && inst == nil {
+		return fmt.Errorf("instance %q not found in state or config", name)
+	}
+
+	if !force {
+		fmt.Printf("This will destroy instance %q:\n", name)
+		if state != nil {
+			for repoName, repo := range state.Repos {
+				fmt.Printf("  Remove worktree: %s (%s)\n", repo.Local, repoName)
+			}
+		} else if inst != nil {
+			for repoName, repo := range inst.Repos {
+				fmt.Printf("  Remove worktree: %s (%s)\n", repo.Local, repoName)
+			}
+		}
+		fmt.Printf("  Delete state file\n")
+		fmt.Printf("  Remove from config\n")
+		fmt.Printf("  Branches on fork are NOT deleted.\n\n")
+		fmt.Printf("Run with --force to confirm.\n")
+		return nil
+	}
+
+	// Collect repo info from whichever source we have
+	type repoInfo struct {
+		local  string
+		branch string
+	}
+	repos := make(map[string]repoInfo)
+	if state != nil {
+		for name, r := range state.Repos {
+			repos[name] = repoInfo{local: r.Local, branch: r.Branch}
+		}
+	} else if inst != nil {
+		for name, r := range inst.Repos {
+			repos[name] = repoInfo{local: r.Local, branch: r.Branch}
+		}
+	}
+
+	// Remove git worktrees
+	for repoName, repo := range repos {
+		if repo.local == "" {
+			continue
+		}
+		if _, err := os.Stat(repo.local); os.IsNotExist(err) {
+			fmt.Printf("  SKIP: %s worktree already gone (%s)\n", repoName, repo.local)
+			continue
+		}
+
+		// Find the main repo that owns this worktree.
+		// Worktree path: <parent>/.worktrees/<repoName>/<instance>
+		// Main repo: <parent>/<repoName>
+		mainRepo := findMainRepoForWorktree(repo.local, repoName)
+		if mainRepo == "" {
+			// Fallback: just remove the directory
+			fmt.Printf("  Removing directory: %s\n", repo.local)
+			if err := os.RemoveAll(repo.local); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", repo.local, err)
+			}
+			continue
+		}
+
+		fmt.Printf("  Removing worktree: %s (%s)\n", repoName, repo.local)
+		if err := runCmd(mainRepo, "git", "worktree", "remove", repo.local, "--force"); err != nil {
+			// Fallback: force remove directory and prune
+			fmt.Fprintf(os.Stderr, "  warning: git worktree remove failed, cleaning up: %v\n", err)
+			os.RemoveAll(repo.local)
+			runCmd(mainRepo, "git", "worktree", "prune")
+		}
+	}
+
+	// Clean up empty .worktrees directories
+	for _, repo := range repos {
+		if repo.local == "" {
+			continue
+		}
+		// Walk up: <parent>/.worktrees/<repoName>/ then <parent>/.worktrees/
+		instanceDir := repo.local
+		repoWorktreeDir := filepath.Dir(instanceDir)
+		worktreeBase := filepath.Dir(repoWorktreeDir)
+
+		removeIfEmpty(repoWorktreeDir)
+		removeIfEmpty(worktreeBase)
+	}
+
+	// Delete state file
+	statePath := instanceStatePath(name)
+	if _, err := os.Stat(statePath); err == nil {
+		fmt.Printf("  Deleting state: %s\n", statePath)
+		os.Remove(statePath)
+	}
+
+	// Remove from config
+	if cfgErr == nil && cfg != nil {
+		if _, exists := cfg.Instances[name]; exists {
+			delete(cfg.Instances, name)
+			if err := SaveConfig(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not update config: %v\n", err)
+			} else {
+				fmt.Printf("  Removed from config\n")
+			}
+		}
+	}
+
+	fmt.Printf("Instance %q destroyed.\n", name)
+	return nil
+}
+
+// findMainRepoForWorktree derives the main repo path from a worktree path.
+// Worktree convention: <parent>/.worktrees/<repoName>/<instance>
+// Main repo:           <parent>/<repoName>
+func findMainRepoForWorktree(worktreePath, repoName string) string {
+	// worktreePath = /home/user/projects/llm-d/.worktrees/scheduler/orca-metrics
+	// We want:       /home/user/projects/llm-d/scheduler
+	instanceDir := worktreePath               // .../scheduler/orca-metrics
+	repoWorktreeDir := filepath.Dir(instanceDir)    // .../scheduler
+	worktreeBase := filepath.Dir(repoWorktreeDir)   // .../.worktrees
+	parent := filepath.Dir(worktreeBase)             // .../llm-d
+
+	if filepath.Base(worktreeBase) != ".worktrees" {
+		return ""
+	}
+
+	mainRepo := filepath.Join(parent, repoName)
+	if _, err := os.Stat(filepath.Join(mainRepo, ".git")); err == nil {
+		return mainRepo
+	}
+	return ""
+}
+
+func removeIfEmpty(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	if len(entries) == 0 {
+		os.Remove(dir)
+	}
 }
 
 // --- sync ---
@@ -407,6 +716,13 @@ func pushInstance(cfg *Config, name string) error {
 	state := loadOrInitState(name, inst)
 
 	for imgName, imageTag := range inst.Images {
+		// Ensure quay.io repo exists before pushing
+		if strings.Contains(imageTag, "quay.io") {
+			if err := EnsureQuayRepo(imageTag); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not ensure quay repo: %v\n", err)
+			}
+		}
+
 		fmt.Printf("Pushing %s (%s)\n", imgName, imageTag)
 		if err := runCmd(".", "podman", "push", imageTag); err != nil {
 			return fmt.Errorf("pushing %s: %w", imgName, err)

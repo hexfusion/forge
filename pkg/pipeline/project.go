@@ -1,6 +1,12 @@
 package pipeline
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Project defines a dependency graph for a set of related repos.
 // It is the schema that forge walks when creating new pipeline instances.
@@ -109,15 +115,16 @@ func (p *Project) ResolveInstance(name string, targetRepos []string) (*Instance,
 		toIn := repoSet[dep.To]
 
 		if dep.Type == "go-module" && fromIn && toIn {
-			fromRepo := p.Repos[dep.From]
 			toRepo := p.Repos[dep.To]
+			// Worktree layout: <parent>/.worktrees/<repo>/<instance>/
+			// Relative path from one worktree to another:
+			//   ../../<to-repo>/<instance>
 			replaces = append(replaces, ReplaceDirective{
 				Source: dep.From,
 				Target: dep.To,
-				GoModLine: fmt.Sprintf("replace %s => ../%s",
-					toRepo.Module, dep.To),
+				GoModLine: fmt.Sprintf("replace %s => ../../%s/%s",
+					toRepo.Module, dep.To, name),
 			})
-			_ = fromRepo // used for validation
 		}
 
 		// If a build dependency target is modified, include the builder repo
@@ -136,7 +143,7 @@ func (p *Project) ResolveInstance(name string, targetRepos []string) (*Instance,
 		repos[repoName] = &RepoConfig{
 			Fork:   pr.Fork,
 			Branch: branchName,
-			Local:  pr.Local,
+			Local:  WorktreeDir(pr.Local, repoName, name),
 		}
 
 		// Resolve images
@@ -166,4 +173,62 @@ func (p *Project) ResolveInstance(name string, targetRepos []string) (*Instance,
 	}
 
 	return inst, nil
+}
+
+// LoadProject reads a project graph YAML file from the projects directory.
+// It searches: $FORGE_PROJECTS_DIR/<name>.yaml, then the forge repo's
+// projects/<name>.yaml relative to the binary.
+func LoadProject(name string) (*Project, error) {
+	path := findProjectFile(name)
+	if path == "" {
+		return nil, fmt.Errorf("project %q not found; create one at projects/%s.yaml", name, name)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading project %s: %w", path, err)
+	}
+
+	var project Project
+	if err := yaml.Unmarshal(data, &project); err != nil {
+		return nil, fmt.Errorf("parsing project %s: %w", path, err)
+	}
+
+	// Expand ~ in local paths
+	for _, repo := range project.Repos {
+		repo.Local = expandHome(repo.Local)
+	}
+
+	return &project, nil
+}
+
+func findProjectFile(name string) string {
+	candidates := []string{
+		os.Getenv("FORGE_PROJECTS_DIR"),
+	}
+
+	// Look relative to the forge source checkout
+	home := mustHomeDir()
+	candidates = append(candidates,
+		filepath.Join(home, "projects", "hexfusion", "forge", "projects"),
+		filepath.Join(home, ".config", "forge", "projects"),
+	)
+
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		p := filepath.Join(dir, name+".yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// WorktreeDir returns the worktree base directory for a repo.
+// Convention: <repo-local-parent>/.worktrees/<repo-name>/
+func WorktreeDir(repoLocal, repoName, instanceName string) string {
+	parent := filepath.Dir(repoLocal)
+	return filepath.Join(parent, ".worktrees", repoName, instanceName)
 }

@@ -149,6 +149,23 @@ func (c *Config) ActiveInstances() map[string]*Instance {
 	return active
 }
 
+// SaveConfig writes the pipeline config back to disk.
+func SaveConfig(cfg *Config) error {
+	if cfg.path == "" {
+		return fmt.Errorf("no config path set")
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	if err := os.WriteFile(cfg.path, data, 0644); err != nil {
+		return fmt.Errorf("writing config %s: %w", cfg.path, err)
+	}
+	return nil
+}
+
 func findConfig() string {
 	candidates := []string{
 		os.Getenv("FORGE_PIPELINE_CONFIG"),

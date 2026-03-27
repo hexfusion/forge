@@ -8,6 +8,7 @@ package pipeline
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -22,6 +23,8 @@ func NewCommand() *cobra.Command {
 		},
 	}
 
+	cmd.AddCommand(newCreateCommand())
+	cmd.AddCommand(newDestroyCommand())
 	cmd.AddCommand(newStatusCommand())
 	cmd.AddCommand(newSyncCommand())
 	cmd.AddCommand(newBuildCommand())
@@ -34,8 +37,81 @@ func NewCommand() *cobra.Command {
 	return cmd
 }
 
+func newCreateCommand() *cobra.Command {
+	var (
+		project     string
+		repos       string
+		description string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "create <instance-name>",
+		Short: "Create a new pipeline instance with git worktrees",
+		Long: `Create a new pipeline instance from a project graph. For each target repo,
+forge creates a git worktree with a new feature branch, resolves go.mod
+replace directives, and writes instance config + state.
+
+Example:
+  forge pipeline create orca-metrics --project llm-d --repos gateway-api-inference-extension,llm-d-inference-scheduler`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			if project == "" {
+				return fmt.Errorf("--project is required")
+			}
+			if repos == "" {
+				return fmt.Errorf("--repos is required")
+			}
+
+			repoList := splitRepos(repos)
+			return createInstance(project, name, description, repoList)
+		},
+	}
+
+	cmd.Flags().StringVar(&project, "project", "", "Project graph name (e.g., llm-d)")
+	cmd.Flags().StringVar(&repos, "repos", "", "Comma-separated repos to include")
+	cmd.Flags().StringVar(&description, "description", "", "Instance description")
+	return cmd
+}
+
+func newDestroyCommand() *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "destroy <instance-name>",
+		Short: "Destroy a pipeline instance, removing worktrees and state",
+		Long: `Destroy a pipeline instance. This removes:
+  - Git worktrees created by 'forge pipeline create'
+  - The instance state file
+  - The instance entry from the config file
+
+Branches on the fork remote are NOT deleted (they are the durable record).
+Use --force to skip confirmation.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return destroyInstance(args[0], force)
+		},
+	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "Skip confirmation")
+	return cmd
+}
+
+func splitRepos(s string) []string {
+	var result []string
+	for _, r := range strings.Split(s, ",") {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			result = append(result, r)
+		}
+	}
+	return result
+}
+
 func newStatusCommand() *cobra.Command {
-	return &cobra.Command{
+	var output string
+
+	cmd := &cobra.Command{
 		Use:   "status [instance]",
 		Short: "Show instance state (repos, branches, images, deployments)",
 		Args:  cobra.MaximumNArgs(1),
@@ -47,9 +123,15 @@ func newStatusCommand() *cobra.Command {
 			if len(args) == 0 {
 				return statusAll(cfg)
 			}
+			if output == "yaml" {
+				return statusInstanceYAML(cfg, args[0])
+			}
 			return statusInstance(cfg, args[0])
 		},
 	}
+
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format (yaml)")
+	return cmd
 }
 
 func newSyncCommand() *cobra.Command {
