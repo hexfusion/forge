@@ -31,6 +31,7 @@ func NewCommand() *cobra.Command {
 	cmd.AddCommand(newPushCommand())
 	cmd.AddCommand(newDeployCommand())
 	cmd.AddCommand(newShipCommand())
+	cmd.AddCommand(newValidateCommand())
 
 	return cmd
 }
@@ -40,22 +41,31 @@ func newCreateCommand() *cobra.Command {
 		project     string
 		repos       string
 		description string
+		from        string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "create <instance-name>",
-		Short: "Create a new pipeline instance with git worktrees",
-		Long: `Create a new pipeline instance from a project graph. For each target repo,
-forge creates a git worktree with a new feature branch, resolves go.mod
-replace directives, and writes instance config + state.
+		Short: "Create a new pipeline instance",
+		Long: `Create a new pipeline instance. Two modes:
 
-Example:
-  forge pipeline create orca-metrics --project llm-d --repos gateway-api-inference-extension,llm-d-inference-scheduler`,
+1. From a project graph (multi-repo development):
+   forge pipeline create orca-metrics --project llm-d --repos scheduler,gateway
+
+2. From a standalone pipeline file (CI testing, image overrides):
+   forge pipeline create rhoai-test --from pipelines/rhoai-ci-test.yaml`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+
+			// Standalone pipeline file mode
+			if from != "" {
+				return createFromPipelineDef(from, name)
+			}
+
+			// Project graph mode
 			if project == "" {
-				return fmt.Errorf("--project is required")
+				return fmt.Errorf("--project or --from is required")
 			}
 			if repos == "" {
 				return fmt.Errorf("--repos is required")
@@ -69,6 +79,7 @@ Example:
 	cmd.Flags().StringVar(&project, "project", "", "Project graph name (e.g., llm-d)")
 	cmd.Flags().StringVar(&repos, "repos", "", "Comma-separated repos to include")
 	cmd.Flags().StringVar(&description, "description", "", "Instance description")
+	cmd.Flags().StringVar(&from, "from", "", "Standalone pipeline def YAML (no project graph needed)")
 	return cmd
 }
 
@@ -208,10 +219,18 @@ named deploy profile (e.g., llm-d-lab-pd).`,
 }
 
 func newShipCommand() *cobra.Command {
-	return &cobra.Command{
+	var (
+		profile  string
+		validate bool
+	)
+
+	cmd := &cobra.Command{
 		Use:   "ship <instance>",
 		Short: "Build, push, and deploy in one step",
-		Args:  cobra.ExactArgs(1),
+		Long: `Build, push, deploy, and optionally validate in one step.
+
+  forge pipeline ship rhoai-test --validate`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := LoadConfig("")
 			if err != nil {
@@ -227,7 +246,43 @@ func newShipCommand() *cobra.Command {
 				return err
 			}
 			fmt.Printf("=== Deploying %s\n", name)
-			return deployInstance(cfg, name)
+			if profile != "" {
+				if err := deployWithProfile(cfg, name, profile); err != nil {
+					return err
+				}
+			} else {
+				if err := deployInstance(cfg, name); err != nil {
+					return err
+				}
+			}
+			if validate {
+				fmt.Printf("=== Validating %s\n", name)
+				return validateInstance(cfg, name)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&profile, "profile", "", "deploy profile for full stack deployment")
+	cmd.Flags().BoolVar(&validate, "validate", false, "run validation after deploy")
+	return cmd
+}
+
+func newValidateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "validate <instance>",
+		Short: "Run post-deploy validation suites",
+		Long: `Run validation steps defined in the pipeline def. Requires an instance
+created with --from (standalone pipeline file).
+
+  forge pipeline validate rhoai-test`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := LoadConfig("")
+			if err != nil {
+				return err
+			}
+			return validateInstance(cfg, args[0])
 		},
 	}
 }

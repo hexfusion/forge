@@ -23,9 +23,14 @@ type Instance struct {
 	Status            string                 `yaml:"status"`
 	Repos             map[string]*RepoConfig `yaml:"repos"`
 	Images            map[string]string      `yaml:"images"`
+	ExternalImages    map[string]string      `yaml:"external_images,omitempty"`
 	ReplaceDirectives []ReplaceDirective     `yaml:"replace_directives"`
 	Deploy            *DeployConfig          `yaml:"deploy,omitempty"`
 	Proposal          string                 `yaml:"proposal,omitempty"`
+
+	// PipelineFile is the path to the source pipeline def YAML
+	// (set when created via --from). Empty for project-graph instances.
+	PipelineFile string `yaml:"pipeline_file,omitempty"`
 }
 
 // RepoConfig tracks a single repo's branch and fork within an instance.

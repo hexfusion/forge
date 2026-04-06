@@ -1,0 +1,46 @@
+# RHOAI CI Image Testing Pipeline
+#
+# Tests custom image combinations against the rhods-operator by patching
+# RELATED_IMAGE_* env vars. Mix external CI images with locally-built ones.
+#
+# Usage:
+#   forge pipeline create rhoai-ci-test --from pipelines/rhoai-ci-test.yaml
+#   forge pipeline ship rhoai-ci-test --validate
+
+name: rhoai-ci-test
+
+images:
+  epp:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9:latest
+    env_var: RELATED_IMAGE_ODH_LLM_D_INFERENCE_SCHEDULER_IMAGE
+
+  routing-sidecar:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-routing-sidecar-rhel9:latest
+    env_var: RELATED_IMAGE_ODH_LLM_D_ROUTING_SIDECAR_IMAGE
+
+  kvcache:
+    source: build
+    local: ~/projects/llm-d/llm-d-kv-cache
+    build_file: Dockerfile
+    registry: quay.io:443/sbatsche
+    name_override: llm-d-kvcache
+    env_var: RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE
+
+deploy:
+  kube_context: labctl-endor
+  namespace: redhat-ods-operator
+  target_deployment: rhods-operator
+  method: env-patch
+
+validate:
+  - name: e2e-smoke
+    command: pytest -m "llminferenceservice and cluster_cpu" test/e2e/llmisvc/ -v
+    working_dir: ~/projects/red-hat-data-services/kserve
+    timeout: 600
+
+  - name: odh-smoke
+    command: pytest -m smoke tests/model_serving/model_server/llmd/test_llmd_smoke.py -v
+    working_dir: ~/projects/opendatahub-io/opendatahub-tests
+    timeout: 600

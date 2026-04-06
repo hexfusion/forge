@@ -50,6 +50,9 @@ type InstanceState struct {
 
 	// Proposal links back to the design doc if any.
 	Proposal string `yaml:"proposal,omitempty"`
+
+	// Validate tracks post-deploy validation results.
+	Validate *ValidateState `yaml:"validate,omitempty"`
 }
 
 // RepoState tracks the state of a single repo within an instance.
@@ -74,6 +77,12 @@ type ImageState struct {
 	// Digest is the image digest from the last build (sha256:...).
 	Digest string `yaml:"digest,omitempty"`
 
+	// Source is "build" or "external". External images skip build/push.
+	Source string `yaml:"source,omitempty"`
+
+	// EnvVar is the RELATED_IMAGE_* env var name for operator injection.
+	EnvVar string `yaml:"env_var,omitempty"`
+
 	// BuildTime is when the image was last built.
 	BuildTime *time.Time `yaml:"build_time,omitempty"`
 
@@ -96,11 +105,17 @@ type DeployState struct {
 	// DeployedDigest is the image digest that was last deployed.
 	DeployedDigest string `yaml:"deployed_digest,omitempty"`
 
+	// DeployedImages maps image name to the deployed reference.
+	DeployedImages map[string]string `yaml:"deployed_images,omitempty"`
+
 	// DeployTime is when the last deploy happened.
 	DeployTime *time.Time `yaml:"deploy_time,omitempty"`
 
 	// DeployCommits records the HEAD commits at deploy time.
 	DeployCommits map[string]string `yaml:"deploy_commits,omitempty"`
+
+	// Method is the deploy strategy used (e.g., "env-patch").
+	Method string `yaml:"method,omitempty"`
 }
 
 // DriftStatus describes the relationship between built, pushed, and deployed state.

@@ -130,18 +130,27 @@ func statusFromState(state *InstanceState) error {
 
 	fmt.Println("\nImages:")
 	for imgName, img := range state.Images {
+		sourceStr := ""
+		if img.Source == "external" {
+			sourceStr = " [external]"
+		}
 		builtStr := "not built"
-		if img.BuildTime != nil {
+		if img.Source == "external" {
+			builtStr = "external"
+		} else if img.BuildTime != nil {
 			builtStr = fmt.Sprintf("built %s", img.BuildTime.Format("2006-01-02 15:04"))
 		}
 		pushedStr := ""
-		if img.Pushed {
+		if img.Pushed && img.Source != "external" {
 			pushedStr = " pushed"
 		}
-		fmt.Printf("  %-10s %s\n", imgName, img.Tag)
-		fmt.Printf("  %-10s %s%s\n", "", builtStr, pushedStr)
+		fmt.Printf("  %-20s %s%s\n", imgName, img.Tag, sourceStr)
+		fmt.Printf("  %-20s %s%s\n", "", builtStr, pushedStr)
+		if img.EnvVar != "" {
+			fmt.Printf("  %-20s -> %s\n", "", img.EnvVar)
+		}
 		if img.Digest != "" {
-			fmt.Printf("  %-10s digest: %s\n", "", truncateDigest(img.Digest))
+			fmt.Printf("  %-20s digest: %s\n", "", truncateDigest(img.Digest))
 		}
 	}
 
@@ -149,11 +158,20 @@ func statusFromState(state *InstanceState) error {
 		fmt.Printf("\nDeploy:\n")
 		fmt.Printf("  cluster:    %s\n", state.Deploy.KubeContext)
 		fmt.Printf("  namespace:  %s\n", state.Deploy.Namespace)
+		if state.Deploy.Method != "" {
+			fmt.Printf("  method:     %s\n", state.Deploy.Method)
+		}
 		if state.Deploy.Deployment != "" {
 			fmt.Printf("  deployment: %s\n", state.Deploy.Deployment)
 		}
 		if state.Deploy.DeployedDigest != "" {
 			fmt.Printf("  digest:     %s\n", truncateDigest(state.Deploy.DeployedDigest))
+		}
+		if len(state.Deploy.DeployedImages) > 0 {
+			fmt.Printf("  images:\n")
+			for imgName, ref := range state.Deploy.DeployedImages {
+				fmt.Printf("    %-20s %s\n", imgName, ref)
+			}
 		}
 		if state.Deploy.DeployTime != nil {
 			fmt.Printf("  deployed:   %s\n", state.Deploy.DeployTime.Format("2006-01-02 15:04"))
@@ -169,6 +187,21 @@ func statusFromState(state *InstanceState) error {
 				fmt.Printf("  status:     DRIFT (running differs from deployed)\n")
 				fmt.Printf("  running:    %s\n", truncateDigest(drift.RunningDigest))
 			}
+		}
+	}
+
+	if state.Validate != nil && len(state.Validate.Results) > 0 {
+		fmt.Printf("\nValidate:\n")
+		for _, r := range state.Validate.Results {
+			status := "PASSED"
+			if !r.Passed {
+				status = fmt.Sprintf("FAILED (exit %d)", r.ExitCode)
+			}
+			timeStr := ""
+			if r.RunTime != nil {
+				timeStr = r.RunTime.Format("2006-01-02 15:04")
+			}
+			fmt.Printf("  %-20s %-8s %-10s %s\n", r.Name, status, r.Duration, timeStr)
 		}
 	}
 
@@ -571,30 +604,42 @@ func syncFromConfig(inst *Instance) error {
 // --- build ---
 
 // buildInstance builds all images defined in the instance.
+// External images (from ExternalImages) are recorded in state but not built.
 func buildInstance(cfg *Config, name string) error {
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
 		return err
 	}
 
-	if len(inst.Images) == 0 {
+	if len(inst.Images) == 0 && len(inst.ExternalImages) == 0 {
 		return fmt.Errorf("instance %q has no images defined", name)
 	}
 
 	state := loadOrInitState(name, inst)
 	hasReplace := len(inst.ReplaceDirectives) > 0
 
+	// Build locally-sourced images
 	for imgName, imageTag := range inst.Images {
 		fmt.Printf("=== Building image: %s (%s)\n", imgName, imageTag)
+
+		// For pipeline-def instances, use the local path from the pipeline def
+		if inst.PipelineFile != "" {
+			def, defErr := LoadPipelineDef(inst.PipelineFile)
+			if defErr == nil {
+				if pImg, ok := def.Images[imgName]; ok && pImg.Local != "" {
+					if err := buildStandalone(pImg.Local, imageTag); err != nil {
+						return fmt.Errorf("building %s: %w", imgName, err)
+					}
+					goto recordBuild
+				}
+			}
+		}
 
 		if hasReplace {
 			if err := buildWithReplace(inst, imgName, imageTag); err != nil {
 				return fmt.Errorf("building %s: %w", imgName, err)
 			}
 		} else {
-			// Find the repo that builds this image — for now, use the first
-			// repo that has a Containerfile. The project graph should drive this
-			// in the future via the ImageDef.
 			repoPath := findBuildRepo(inst)
 			if repoPath == "" {
 				return fmt.Errorf("cannot determine build repo for image %s", imgName)
@@ -604,6 +649,7 @@ func buildInstance(cfg *Config, name string) error {
 			}
 		}
 
+	recordBuild:
 		now := time.Now()
 		digest, err := getImageDigest(imageTag)
 		if err != nil {
@@ -614,9 +660,29 @@ func buildInstance(cfg *Config, name string) error {
 		state.Images[imgName] = &ImageState{
 			Tag:          imageTag,
 			Digest:       digest,
+			Source:       "build",
 			BuildTime:    &now,
 			BuildCommits: buildCommits,
 			Pushed:       false,
+		}
+	}
+
+	// Record external images in state (no build needed)
+	for imgName, ref := range inst.ExternalImages {
+		fmt.Printf("  External: %s (%s)\n", imgName, ref)
+		envVar := ""
+		if inst.PipelineFile != "" {
+			if def, err := LoadPipelineDef(inst.PipelineFile); err == nil {
+				if pImg, ok := def.Images[imgName]; ok {
+					envVar = pImg.EnvVar
+				}
+			}
+		}
+		state.Images[imgName] = &ImageState{
+			Tag:    ref,
+			Source: "external",
+			EnvVar: envVar,
+			Pushed: true, // already in registry
 		}
 	}
 
@@ -756,6 +822,12 @@ func pushInstance(cfg *Config, name string) error {
 	state := loadOrInitState(name, inst)
 
 	for imgName, imageTag := range inst.Images {
+		// Skip external images — already in registry
+		if img, ok := state.Images[imgName]; ok && img.Source == "external" {
+			fmt.Printf("  SKIP (external): %s (%s)\n", imgName, imageTag)
+			continue
+		}
+
 		// Ensure quay.io repo exists before pushing
 		if strings.Contains(imageTag, "quay.io") {
 			if err := EnsureQuayRepo(imageTag); err != nil {
@@ -781,6 +853,8 @@ func pushInstance(cfg *Config, name string) error {
 // --- deploy ---
 
 // deployInstance deploys images using the instance's deploy config.
+// If the instance was created from a pipeline def with method "env-patch",
+// it uses deployEnvPatch. Otherwise uses the original kubectl set image path.
 func deployInstance(cfg *Config, name string) error {
 	inst, err := cfg.GetInstance(name)
 	if err != nil {
@@ -794,7 +868,15 @@ func deployInstance(cfg *Config, name string) error {
 
 	state := loadOrInitState(name, inst)
 
-	// Deploy each image to its configured deployment
+	// Check if this is a pipeline-def instance with env-patch method
+	if inst.PipelineFile != "" {
+		def, defErr := LoadPipelineDef(inst.PipelineFile)
+		if defErr == nil && def.Deploy != nil && def.Deploy.Method == "env-patch" {
+			return deployEnvPatch(name, inst, def, state)
+		}
+	}
+
+	// Original deploy path: kubectl set image
 	for imgName, imageTag := range inst.Images {
 		if deploy.EPPDeployment == "" {
 			return fmt.Errorf("instance %q deploy config missing 'epp_deployment' for image %s", name, imgName)
@@ -847,6 +929,73 @@ func deployInstance(cfg *Config, name string) error {
 	return SaveState(state)
 }
 
+// deployEnvPatch patches RELATED_IMAGE_* env vars on an operator deployment.
+// This is the deploy method for pipeline-def instances with method: env-patch.
+func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *InstanceState) error {
+	deploy := def.Deploy
+	fmt.Printf("=== env-patch: %s/%s (deploy/%s)\n",
+		deploy.KubeContext, deploy.Namespace, deploy.TargetDeployment)
+
+	var envArgs []string
+	deployedImages := make(map[string]string)
+
+	// Collect env var overrides from all images (build + external)
+	for imgName, pImg := range def.Images {
+		if pImg.EnvVar == "" {
+			continue
+		}
+
+		// Find the image ref from state
+		imgState, ok := state.Images[imgName]
+		if !ok {
+			fmt.Printf("  SKIP: %s (not in state — run build first)\n", imgName)
+			continue
+		}
+
+		ref := imgState.Tag
+		fmt.Printf("  %s = %s\n", pImg.EnvVar, ref)
+		envArgs = append(envArgs, pImg.EnvVar+"="+ref)
+		deployedImages[imgName] = ref
+	}
+
+	if len(envArgs) == 0 {
+		return fmt.Errorf("no images with env_var to inject for %s", name)
+	}
+
+	// oc set env deploy/<target> KEY=VAL KEY=VAL ...
+	args := []string{
+		"--context", deploy.KubeContext,
+		"-n", deploy.Namespace,
+		"set", "env", "deploy/" + deploy.TargetDeployment,
+	}
+	args = append(args, envArgs...)
+
+	if err := runCmd(".", "kubectl", args...); err != nil {
+		return fmt.Errorf("patching env vars: %w", err)
+	}
+
+	fmt.Println("Waiting for rollout...")
+	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+		"-n", deploy.Namespace, "rollout", "status",
+		"deployment/"+deploy.TargetDeployment, "--timeout=120s"); err != nil {
+		return err
+	}
+
+	// Record deploy state
+	now := time.Now()
+	state.Deploy = &DeployState{
+		KubeContext:    deploy.KubeContext,
+		Namespace:      deploy.Namespace,
+		Deployment:     deploy.TargetDeployment,
+		DeployedImages: deployedImages,
+		DeployTime:     &now,
+		DeployCommits:  collectCommits(inst),
+		Method:         "env-patch",
+	}
+
+	return SaveState(state)
+}
+
 // deployWithProfile deploys a full stack using a deploy profile.
 func deployWithProfile(cfg *Config, name, profileName string) error {
 	inst, err := cfg.GetInstance(name)
@@ -893,6 +1042,198 @@ func deployWithProfile(cfg *Config, name, profileName string) error {
 	}
 
 	return SaveState(state)
+}
+
+// --- validate ---
+
+// validateInstance runs post-deploy validation steps from the pipeline def.
+func validateInstance(cfg *Config, name string) error {
+	inst, err := cfg.GetInstance(name)
+	if err != nil {
+		return err
+	}
+
+	if inst.PipelineFile == "" {
+		return fmt.Errorf("instance %q has no pipeline file; validate requires --from pipeline def", name)
+	}
+
+	def, err := LoadPipelineDef(inst.PipelineFile)
+	if err != nil {
+		return err
+	}
+
+	if len(def.Validate) == 0 {
+		return fmt.Errorf("pipeline def %q has no validate steps", def.Name)
+	}
+
+	state := loadOrInitState(name, inst)
+	if state.Validate == nil {
+		state.Validate = &ValidateState{}
+	}
+	// Reset results for this run
+	state.Validate.Results = nil
+
+	for _, step := range def.Validate {
+		fmt.Printf("=== Validate: %s\n", step.Name)
+		fmt.Printf("  %s\n", step.Command)
+
+		result := runValidateStep(&step)
+		state.Validate.Results = append(state.Validate.Results, result)
+
+		if result.Passed {
+			fmt.Printf("  PASSED (%s)\n\n", result.Duration)
+		} else {
+			fmt.Printf("  FAILED (exit %d, %s)\n\n", result.ExitCode, result.Duration)
+		}
+	}
+
+	return SaveState(state)
+}
+
+func runValidateStep(step *ValidateStep) ValidateResult {
+	timeout := step.Timeout
+	if timeout == 0 {
+		timeout = 300
+	}
+
+	dir := step.WorkingDir
+	if dir == "" {
+		dir = "."
+	}
+
+	start := time.Now()
+	cmd := exec.Command("bash", "-c", step.Command)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	duration := time.Since(start)
+	now := time.Now()
+
+	exitCode := 0
+	passed := true
+	if err != nil {
+		passed = false
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+
+	return ValidateResult{
+		Name:     step.Name,
+		Passed:   passed,
+		ExitCode: exitCode,
+		Duration: duration.Truncate(time.Second).String(),
+		RunTime:  &now,
+	}
+}
+
+// --- create from pipeline def ---
+
+// createFromPipelineDef creates an instance from a standalone pipeline YAML.
+// No project graph required. External images are recorded; build images get
+// their local paths validated.
+func createFromPipelineDef(path, name string) error {
+	def, err := LoadPipelineDef(path)
+	if err != nil {
+		return err
+	}
+
+	if name == "" {
+		name = def.Name
+	}
+
+	// Check if instance already exists
+	cfg, cfgErr := LoadConfig("")
+	if cfgErr == nil {
+		if _, err := cfg.GetInstance(name); err == nil {
+			return fmt.Errorf("instance %q already exists", name)
+		}
+	}
+
+	inst := def.ToInstance(name)
+	inst.PipelineFile = path
+
+	// Also populate EnvVar in build images from the pipeline def
+	for imgName, pImg := range def.Images {
+		if !pImg.IsExternal() && pImg.Local != "" {
+			// Validate the local path exists
+			if _, err := os.Stat(pImg.Local); os.IsNotExist(err) {
+				return fmt.Errorf("image %s: local path not found: %s", imgName, pImg.Local)
+			}
+		}
+	}
+
+	// Write initial state
+	now := time.Now()
+	state := &InstanceState{
+		Name:        name,
+		Status:      "active",
+		Description: inst.Description,
+		Created:     now,
+		Repos:       make(map[string]*RepoState),
+		Images:      make(map[string]*ImageState),
+	}
+
+	// Pre-populate image state entries
+	for imgName, pImg := range def.Images {
+		tag := pImg.ImageTag(imgName, name)
+		if pImg.IsExternal() {
+			state.Images[imgName] = &ImageState{
+				Tag:    tag,
+				Source: "external",
+				EnvVar: pImg.EnvVar,
+				Pushed: true,
+			}
+		} else {
+			state.Images[imgName] = &ImageState{
+				Tag:    tag,
+				Source: "build",
+				EnvVar: pImg.EnvVar,
+			}
+		}
+	}
+
+	if err := SaveState(state); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+
+	// Append to config file
+	if cfgErr == nil && cfg != nil {
+		cfg.Instances[name] = inst
+		if err := SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not update config file: %v\n", err)
+		}
+	} else {
+		// Create a new config if none exists
+		configPath := findConfig()
+		if configPath == "" {
+			configPath = expandHome("~/.config/forge/pipelines.yaml")
+			os.MkdirAll(expandHome("~/.config/forge"), 0755)
+		}
+		cfg = &Config{
+			path:      configPath,
+			Instances: map[string]*Instance{name: inst},
+		}
+		if err := SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not create config file: %v\n", err)
+		}
+	}
+
+	fmt.Printf("Instance %q created from %s\n", name, path)
+	fmt.Printf("  Images: %d build, %d external\n", len(inst.Images), len(inst.ExternalImages))
+	fmt.Printf("  Run 'forge pipeline build %s' to build local images.\n", name)
+	if def.Deploy != nil {
+		fmt.Printf("  Deploy method: %s -> %s\n", def.Deploy.Method, def.Deploy.TargetDeployment)
+	}
+	if len(def.Validate) > 0 {
+		fmt.Printf("  Validate steps: %d\n", len(def.Validate))
+	}
+
+	return nil
 }
 
 // --- helpers ---
