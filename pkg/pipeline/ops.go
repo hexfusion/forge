@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -929,23 +930,23 @@ func deployInstance(cfg *Config, name string) error {
 	return SaveState(state)
 }
 
-// deployEnvPatch patches RELATED_IMAGE_* env vars on an operator deployment.
-// This is the deploy method for pipeline-def instances with method: env-patch.
+// deployEnvPatch patches RELATED_IMAGE_* env vars on the OLM-managed CSV.
+// Patching the CSV instead of the deployment prevents OLM from reverting
+// our changes. OLM propagates the CSV's env vars to the deployment.
 func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *InstanceState) error {
 	deploy := def.Deploy
 	fmt.Printf("=== env-patch: %s/%s (deploy/%s)\n",
 		deploy.KubeContext, deploy.Namespace, deploy.TargetDeployment)
 
-	var envArgs []string
+	// Collect desired env var overrides
+	overrides := make(map[string]string) // envVarName -> imageRef
 	deployedImages := make(map[string]string)
 
-	// Collect env var overrides from all images (build + external)
 	for imgName, pImg := range def.Images {
 		if pImg.EnvVar == "" {
 			continue
 		}
 
-		// Find the image ref from state
 		imgState, ok := state.Images[imgName]
 		if !ok {
 			fmt.Printf("  SKIP: %s (not in state — run build first)\n", imgName)
@@ -954,30 +955,73 @@ func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *Instan
 
 		ref := imgState.Tag
 		fmt.Printf("  %s = %s\n", pImg.EnvVar, ref)
-		envArgs = append(envArgs, pImg.EnvVar+"="+ref)
+		overrides[pImg.EnvVar] = ref
 		deployedImages[imgName] = ref
 	}
 
-	if len(envArgs) == 0 {
+	if len(overrides) == 0 {
 		return fmt.Errorf("no images with env_var to inject for %s", name)
 	}
 
-	// oc set env deploy/<target> KEY=VAL KEY=VAL ...
-	args := []string{
-		"--context", deploy.KubeContext,
-		"-n", deploy.Namespace,
-		"set", "env", "deploy/" + deploy.TargetDeployment,
+	// Find the CSV name for this operator
+	csvName, err := findCSV(deploy.KubeContext, deploy.Namespace, deploy.TargetDeployment)
+	if err != nil {
+		return fmt.Errorf("finding CSV: %w", err)
 	}
-	args = append(args, envArgs...)
+	fmt.Printf("  CSV: %s\n", csvName)
 
-	if err := runCmd(".", "kubectl", args...); err != nil {
-		return fmt.Errorf("patching env vars: %w", err)
+	// Read the current env array from the CSV to find indices
+	envJSON, err := cmdOutput(".", "kubectl", "--context", deploy.KubeContext,
+		"-n", deploy.Namespace, "get", "csv", csvName,
+		"-o", "jsonpath={.spec.install.spec.deployments[0].spec.template.spec.containers[0].env}")
+	if err != nil {
+		return fmt.Errorf("reading CSV env: %w", err)
 	}
 
-	fmt.Println("Waiting for rollout...")
+	// Parse the env array to find indices for each var we want to patch
+	type envEntry struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	var envs []envEntry
+	if err := json.Unmarshal([]byte(envJSON), &envs); err != nil {
+		return fmt.Errorf("parsing CSV env array: %w", err)
+	}
+
+	// Build JSON patch operations
+	var patches []string
+	for envVar, ref := range overrides {
+		found := false
+		for i, e := range envs {
+			if e.Name == envVar {
+				patches = append(patches,
+					fmt.Sprintf(`{"op":"replace","path":"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/%d/value","value":"%s"}`, i, ref))
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Append new env var if not found
+			patches = append(patches,
+				fmt.Sprintf(`{"op":"add","path":"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/-","value":{"name":"%s","value":"%s"}}`, envVar, ref))
+		}
+	}
+
+	patchJSON := "[" + strings.Join(patches, ",") + "]"
+
+	// Apply the JSON patch to the CSV
+	fmt.Printf("  Patching CSV %s with %d env var overrides...\n", csvName, len(overrides))
+	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+		"-n", deploy.Namespace, "patch", "csv", csvName,
+		"--type=json", "-p", patchJSON); err != nil {
+		return fmt.Errorf("patching CSV: %w", err)
+	}
+
+	// OLM will now reconcile the deployment — wait for rollout
+	fmt.Println("  Waiting for OLM to reconcile deployment...")
 	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
 		"-n", deploy.Namespace, "rollout", "status",
-		"deployment/"+deploy.TargetDeployment, "--timeout=120s"); err != nil {
+		"deployment/"+deploy.TargetDeployment, "--timeout=180s"); err != nil {
 		return err
 	}
 
@@ -1234,6 +1278,26 @@ func createFromPipelineDef(path, name string) error {
 	}
 
 	return nil
+}
+
+// findCSV finds the ClusterServiceVersion that owns a given deployment.
+func findCSV(kubeContext, namespace, deploymentName string) (string, error) {
+	// List CSVs and find the one whose deployment matches
+	out, err := cmdOutput(".", "kubectl", "--context", kubeContext,
+		"-n", namespace, "get", "csv",
+		"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.spec.install.spec.deployments[0].name}{\"\\n\"}{end}")
+	if err != nil {
+		return "", fmt.Errorf("listing CSVs: %w", err)
+	}
+
+	for _, line := range strings.Split(trimSpace(out), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 && trimSpace(parts[1]) == deploymentName {
+			return trimSpace(parts[0]), nil
+		}
+	}
+
+	return "", fmt.Errorf("no CSV found owning deployment %q in %s", deploymentName, namespace)
 }
 
 // --- helpers ---
