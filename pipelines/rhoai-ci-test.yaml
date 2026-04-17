@@ -6,26 +6,48 @@
 # Usage:
 #   forge pipeline create rhoai-ci-test --from pipelines/rhoai-ci-test.yaml
 #   forge pipeline ship rhoai-ci-test --validate
+#
+# Note: The operator image itself must also be rhoai-3.4 for CRD/code alignment.
+# Patch separately: CSV .spec.install.spec.deployments[0].spec.template.spec.containers[0].image
+# = quay.io/rhoai/odh-rhel9-operator:rhoai-3.4
 
 name: rhoai-ci-test
 
 images:
   epp:
     source: external
-    ref: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9@sha256:3c099f1079e2f2111f3f4a85505ac8b95eb789f69ea3062a53d40f8e7c401646
+    ref: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9:rhoai-3.4
     env_var: RELATED_IMAGE_ODH_LLM_D_INFERENCE_SCHEDULER_IMAGE
 
   routing-sidecar:
     source: external
-    ref: quay.io/rhoai/odh-llm-d-routing-sidecar-rhel9@sha256:02fac7d2f20bd20820e25cb38d7a6d18ac49c6290ad715f62ebdb0729df76f31
+    ref: quay.io/rhoai/odh-llm-d-routing-sidecar-rhel9:rhoai-3.4
     env_var: RELATED_IMAGE_ODH_LLM_D_ROUTING_SIDECAR_IMAGE
 
-  # kvcache: not yet wired in the operator (no RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE env var)
-  # uncomment when operator adds support:
-  # kvcache:
-  #   source: external
-  #   ref: quay.io/rhoai/pull-request-pipelines:odh-llm-d-kv-cache-3f7e241e751a283ee98b7790d40b2612c019fdcb
-  #   env_var: RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE
+  kvcache:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-kv-cache-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE
+
+  kserve-storage-initializer:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-storage-initializer-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_STORAGE_INITIALIZER_IMAGE
+
+  kserve-controller:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-controller-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_CONTROLLER_IMAGE
+
+  kserve-agent:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-agent-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_AGENT_IMAGE
+
+  kserve-router:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-router-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_ROUTER_IMAGE
 
 deploy:
   kube_context: default/api-dagobah-hexfusion-local:6443/kube:admin

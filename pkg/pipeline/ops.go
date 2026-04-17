@@ -933,6 +933,7 @@ func deployInstance(cfg *Config, name string) error {
 // deployEnvPatch patches RELATED_IMAGE_* env vars on the OLM-managed CSV.
 // Patching the CSV instead of the deployment prevents OLM from reverting
 // our changes. OLM propagates the CSV's env vars to the deployment.
+// Uses `oc` instead of `kubectl` since this targets OCP/OLM clusters.
 func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *InstanceState) error {
 	deploy := def.Deploy
 	fmt.Printf("=== env-patch: %s/%s (deploy/%s)\n",
@@ -971,7 +972,7 @@ func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *Instan
 	fmt.Printf("  CSV: %s\n", csvName)
 
 	// Read the current env array from the CSV to find indices
-	envJSON, err := cmdOutput(".", "kubectl", "--context", deploy.KubeContext,
+	envJSON, err := cmdOutput(".", "oc", "--context", deploy.KubeContext,
 		"-n", deploy.Namespace, "get", "csv", csvName,
 		"-o", "jsonpath={.spec.install.spec.deployments[0].spec.template.spec.containers[0].env}")
 	if err != nil {
@@ -1011,7 +1012,7 @@ func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *Instan
 
 	// Apply the JSON patch to the CSV
 	fmt.Printf("  Patching CSV %s with %d env var overrides...\n", csvName, len(overrides))
-	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+	if err := runCmd(".", "oc", "--context", deploy.KubeContext,
 		"-n", deploy.Namespace, "patch", "csv", csvName,
 		"--type=json", "-p", patchJSON); err != nil {
 		return fmt.Errorf("patching CSV: %w", err)
@@ -1019,7 +1020,7 @@ func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *Instan
 
 	// OLM will now reconcile the deployment — wait for rollout
 	fmt.Println("  Waiting for OLM to reconcile deployment...")
-	if err := runCmd(".", "kubectl", "--context", deploy.KubeContext,
+	if err := runCmd(".", "oc", "--context", deploy.KubeContext,
 		"-n", deploy.Namespace, "rollout", "status",
 		"deployment/"+deploy.TargetDeployment, "--timeout=180s"); err != nil {
 		return err
@@ -1283,7 +1284,7 @@ func createFromPipelineDef(path, name string) error {
 // findCSV finds the ClusterServiceVersion that owns a given deployment.
 func findCSV(kubeContext, namespace, deploymentName string) (string, error) {
 	// List CSVs and find the one whose deployment matches
-	out, err := cmdOutput(".", "kubectl", "--context", kubeContext,
+	out, err := cmdOutput(".", "oc", "--context", kubeContext,
 		"-n", namespace, "get", "csv",
 		"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.spec.install.spec.deployments[0].name}{\"\\n\"}{end}")
 	if err != nil {
