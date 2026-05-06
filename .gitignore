@@ -1,1 +1,3 @@
-forge
+# Built binary at repo root, not the cmd/forge/ source dir.
+/forge
+
