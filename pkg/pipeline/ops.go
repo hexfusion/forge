@@ -621,14 +621,26 @@ func buildInstance(cfg *Config, name string) error {
 
 	// Build locally-sourced images
 	for imgName, imageTag := range inst.Images {
-		fmt.Printf("=== Building image: %s (%s)\n", imgName, imageTag)
+		var gitInfo GitBuildInfo
 
 		// For pipeline-def instances, use the local path from the pipeline def
 		if inst.PipelineFile != "" {
 			def, defErr := LoadPipelineDef(inst.PipelineFile)
 			if defErr == nil {
 				if pImg, ok := def.Images[imgName]; ok && pImg.Local != "" {
-					if err := buildStandalone(pImg.Local, imageTag); err != nil {
+					buildPath := pImg.Local
+					// Git-branch build: resolve branch/SHA (optionally into a
+					// worktree) and recompute the tag from the template.
+					if pImg.Git != nil || pImg.TagTemplate != "" {
+						bp, info, gerr := resolveGitBuild(pImg)
+						if gerr != nil {
+							return fmt.Errorf("resolving git build for %s: %w", imgName, gerr)
+						}
+						buildPath, gitInfo = bp, info
+						imageTag = pImg.ResolveTag(imgName, name, info)
+					}
+					fmt.Printf("=== Building image: %s (%s)\n", imgName, imageTag)
+					if err := buildStandalone(buildPath, pImg.BuildFile, imageTag); err != nil {
 						return fmt.Errorf("building %s: %w", imgName, err)
 					}
 					goto recordBuild
@@ -636,6 +648,7 @@ func buildInstance(cfg *Config, name string) error {
 			}
 		}
 
+		fmt.Printf("=== Building image: %s (%s)\n", imgName, imageTag)
 		if hasReplace {
 			if err := buildWithReplace(inst, imgName, imageTag); err != nil {
 				return fmt.Errorf("building %s: %w", imgName, err)
@@ -645,7 +658,7 @@ func buildInstance(cfg *Config, name string) error {
 			if repoPath == "" {
 				return fmt.Errorf("cannot determine build repo for image %s", imgName)
 			}
-			if err := buildStandalone(repoPath, imageTag); err != nil {
+			if err := buildStandalone(repoPath, "", imageTag); err != nil {
 				return fmt.Errorf("building %s: %w", imgName, err)
 			}
 		}
@@ -657,6 +670,14 @@ func buildInstance(cfg *Config, name string) error {
 			fmt.Fprintf(os.Stderr, "  warning: could not retrieve digest for %s: %v\n", imageTag, err)
 		}
 		buildCommits := collectCommits(inst)
+		// Record the resolved commit for git-branch builds (the worktree
+		// isn't in inst.Repos, so collectCommits won't capture it).
+		if gitInfo.FullSHA != "" {
+			if buildCommits == nil {
+				buildCommits = map[string]string{}
+			}
+			buildCommits[imgName] = gitInfo.FullSHA
+		}
 
 		state.Images[imgName] = &ImageState{
 			Tag:          imageTag,
@@ -783,14 +804,143 @@ func buildWithReplace(inst *Instance, imgName, imageTag string) error {
 	return runCmd(parentDir, "podman", "build", "-t", imageTag, "-f", tmpFile.Name(), ".")
 }
 
-func buildStandalone(repoPath, imageTag string) error {
-	// Find the container build file — check Containerfile first, then Dockerfile variants
-	containerfile := findContainerfile(repoPath)
+func buildStandalone(repoPath, buildFile, imageTag string) error {
+	// Use the explicit build_file if given, else discover a Containerfile.
+	containerfile := buildFile
+	if containerfile == "" {
+		containerfile = findContainerfile(repoPath)
+	}
 	if containerfile == "" {
 		return fmt.Errorf("no Containerfile or Dockerfile found in %s", repoPath)
 	}
 	fmt.Printf("Building %s (standalone from %s using %s)\n", imageTag, repoPath, containerfile)
 	return runCmd(repoPath, "podman", "build", "-t", imageTag, "-f", containerfile, ".")
+}
+
+// resolveGitBuild prepares the source tree for a git-branch build and returns
+// the directory to build from plus the resolved git facts. It honors
+// img.Git.Remote (fetch first) and img.Git.Worktree (build from an isolated
+// worktree instead of the user's checkout). With no Git block it resolves the
+// repo's current HEAD so a bare tag_template still gets a branch/SHA.
+func resolveGitBuild(img *PipelineImage) (buildPath string, info GitBuildInfo, err error) {
+	local := img.Local
+	if local == "" {
+		return "", info, fmt.Errorf("git build requires 'local' repo path")
+	}
+	if _, statErr := os.Stat(local); statErr != nil {
+		return "", info, fmt.Errorf("local repo not found: %s", local)
+	}
+
+	var branch, remote, worktree string
+	if img.Git != nil {
+		branch, remote, worktree = img.Git.Branch, img.Git.Remote, img.Git.Worktree
+	}
+
+	// Default to the current HEAD branch when none is declared.
+	if branch == "" {
+		out, e := cmdOutput(local, "git", "rev-parse", "--abbrev-ref", "HEAD")
+		if e != nil {
+			return "", info, fmt.Errorf("resolving current branch in %s: %w", local, e)
+		}
+		branch = trimSpace(out)
+	}
+
+	// Fetch the remote so its branch ref is current before we resolve it.
+	if remote != "" {
+		fmt.Printf("    fetching %s %s...\n", remote, branch)
+		if e := runCmd(local, "git", "fetch", remote, branch); e != nil {
+			fmt.Fprintf(os.Stderr, "    warning: fetch %s %s failed: %v\n", remote, branch, e)
+		}
+	}
+
+	ref, fullSHA, e := resolveRef(local, remote, branch)
+	if e != nil {
+		return "", info, e
+	}
+	shortSHA := fullSHA
+	if len(shortSHA) > 7 {
+		shortSHA = shortSHA[:7]
+	}
+	info = GitBuildInfo{Branch: branch, ShortSHA: shortSHA, FullSHA: fullSHA}
+
+	// Worktree path: build in isolation, never touching the user's checkout.
+	if worktree != "" {
+		if e := setupWorktree(local, worktree, ref); e != nil {
+			return "", info, e
+		}
+		return worktree, info, nil
+	}
+
+	// No worktree: build from local, checking out the ref in place only when
+	// it differs from HEAD. Refuse to clobber uncommitted changes.
+	headOut, _ := cmdOutput(local, "git", "rev-parse", "HEAD")
+	if trimSpace(headOut) != fullSHA {
+		if isDirty(local) {
+			return "", info, fmt.Errorf(
+				"%s has uncommitted changes; commit/stash them or set git.worktree to build %q safely",
+				local, branch)
+		}
+		fmt.Printf("    checking out %s in %s...\n", ref, local)
+		if e := runCmd(local, "git", "checkout", ref); e != nil {
+			return "", info, fmt.Errorf("checkout %s: %w", ref, e)
+		}
+	}
+	return local, info, nil
+}
+
+// resolveRef finds a usable ref for branch (preferring <remote>/<branch> when
+// a remote is set) and returns the ref name and its full commit SHA.
+func resolveRef(local, remote, branch string) (ref, fullSHA string, err error) {
+	var candidates []string
+	if remote != "" {
+		candidates = append(candidates, remote+"/"+branch)
+	}
+	candidates = append(candidates, branch)
+	for _, c := range candidates {
+		out, e := cmdOutput(local, "git", "rev-parse", "--verify", "--quiet", c+"^{commit}")
+		if e == nil {
+			if sha := trimSpace(out); sha != "" {
+				return c, sha, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("branch %q not found in %s (tried: %s)",
+		branch, local, strings.Join(candidates, ", "))
+}
+
+// setupWorktree ensures worktree exists checked out at ref (detached HEAD),
+// creating it from local if needed. Reusing an existing worktree avoids
+// re-cloning on repeat build/ship cycles. --force is safe here because the
+// worktree is forge-managed, not the user's checkout.
+func setupWorktree(local, worktree, ref string) error {
+	if fi, err := os.Stat(worktree); err == nil && fi.IsDir() {
+		if !isGitWorktree(worktree) {
+			return fmt.Errorf("worktree path %s exists but is not a git worktree", worktree)
+		}
+		fmt.Printf("    updating worktree %s -> %s...\n", worktree, ref)
+		if err := runCmd(worktree, "git", "checkout", "--detach", "--force", ref); err != nil {
+			return fmt.Errorf("worktree checkout %s: %w", ref, err)
+		}
+		return nil
+	}
+	fmt.Printf("    creating worktree %s at %s...\n", worktree, ref)
+	if err := runCmd(local, "git", "worktree", "add", "--detach", "--force", worktree, ref); err != nil {
+		return fmt.Errorf("git worktree add: %w", err)
+	}
+	return nil
+}
+
+func isGitWorktree(dir string) bool {
+	out, err := cmdOutput(dir, "git", "rev-parse", "--is-inside-work-tree")
+	return err == nil && trimSpace(out) == "true"
+}
+
+func isDirty(dir string) bool {
+	out, err := cmdOutput(dir, "git", "status", "--porcelain")
+	if err != nil {
+		return false
+	}
+	return trimSpace(out) != ""
 }
 
 func findContainerfile(dir string) string {
@@ -823,10 +973,17 @@ func pushInstance(cfg *Config, name string) error {
 	state := loadOrInitState(name, inst)
 
 	for imgName, imageTag := range inst.Images {
-		// Skip external images — already in registry
-		if img, ok := state.Images[imgName]; ok && img.Source == "external" {
-			fmt.Printf("  SKIP (external): %s (%s)\n", imgName, imageTag)
-			continue
+		if img, ok := state.Images[imgName]; ok {
+			// Skip external images — already in registry
+			if img.Source == "external" {
+				fmt.Printf("  SKIP (external): %s (%s)\n", imgName, imageTag)
+				continue
+			}
+			// Prefer the tag recorded at build time. For git-branch builds it
+			// carries the resolved branch/SHA, not the instance-name placeholder.
+			if img.Tag != "" {
+				imageTag = img.Tag
+			}
 		}
 
 		// Ensure quay.io repo exists before pushing
