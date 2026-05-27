@@ -1,0 +1,73 @@
+# Baseline pipeline for the audio/video multimodal routing experiment.
+#
+# Pins the stock rhoai-3.4 images. Used as the "before" reference to
+# demonstrate that audio and video content blocks drop silently in the
+# EPP wire format. Compare against `audio-video-pr1115-*` which builds
+# llm-d-router from PR #1115's branch to demonstrate the fix.
+#
+# Usage:
+#   forge pipeline create audio-video-baseline --from pipelines/audio-video-baseline.yaml
+#   forge pipeline ship audio-video-baseline --validate
+
+name: audio-video-baseline
+
+images:
+  epp:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_INFERENCE_SCHEDULER_IMAGE
+
+  routing-sidecar:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-routing-sidecar-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_ROUTING_SIDECAR_IMAGE
+
+  kvcache:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-kv-cache-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE
+
+  kserve-storage-initializer:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-storage-initializer-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_STORAGE_INITIALIZER_IMAGE
+
+  kserve-controller:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-controller-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_CONTROLLER_IMAGE
+
+  kserve-agent:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-agent-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_AGENT_IMAGE
+
+  kserve-router:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-router-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_ROUTER_IMAGE
+
+deploy:
+  kube_context: default/api-dagobah-hexfusion-local:6443/kube:admin
+  namespace: redhat-ods-operator
+  target_deployment: rhods-operator
+  method: env-patch
+
+# Validation runs the routing-affinity tests under both upstream-shape and
+# downstream-shape CRs. The expectation for baseline is: image works, audio
+# and video silently drop (no cache affinity, empty mm_hashes for those keys).
+validate:
+  - name: image-cache-affinity
+    command: ./scripts/test-image-affinity.sh
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600
+
+  - name: audio-cache-affinity-baseline-drops
+    command: ./scripts/test-audio-affinity.sh --expect drop
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600
+
+  - name: video-cache-affinity-baseline-drops
+    command: ./scripts/test-video-affinity.sh --expect drop
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600

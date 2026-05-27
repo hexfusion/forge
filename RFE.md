@@ -102,3 +102,75 @@ images:
 
 Defaults to local. SSH-remote is the smallest viable second backend (rsync
 the source, run podman/docker over ssh, push from the remote directly).
+
+## 8. Declarative CR/manifest apply (deploy shapes)
+
+From the audio/video PR #1115 validation (2026-05-27).
+
+`deploy` today only patches operator *images* (`method: env-patch` on the
+CSV). It can't apply the *CRs* that define the deployment **shape** — native
+`InferencePool` + agentgateway (upstream) vs `LLMInferenceServiceConfig`
+(downstream). As a result `audio-video-pr1115-upstream.yaml` and
+`-downstream.yaml` are identical except for a `--shape` flag passed to
+external validate scripts; the shape lives in shell, not in forge.
+
+Add a manifest-apply step so the shape lives in the pipeline def:
+
+```yaml
+deploy:
+  kube_context: ...
+  namespace: ...
+  target_deployment: rhods-operator
+  method: env-patch
+  manifests:                      # oc apply -f, after the image patch + rollout
+    - ~/.../crs/upstream/inferencepool.yaml
+    - ~/.../crs/upstream/gateway.yaml
+  # or a directory applied in sorted order:
+  # manifest_dir: ~/.../crs/upstream
+```
+
+Requirements:
+- `manifests:` / `manifest_dir:` on `PipelineDeploy`; applied after the
+  env-patch + rollout, in a deterministic order.
+- `forge pipeline cleanup` (#5) deletes them on teardown.
+- Generic `oc apply` — not tied to llm-d CR kinds.
+
+**Result:** the two PR #1115 defs would differ only in `manifests:`, and the
+`--shape` flag disappears from the validate scripts.
+
+## 9. Side-by-side instances (deployment-scoped deploy)
+
+Also from the PR #1115 work.
+
+`env-patch` mutates the operator CSV — a cluster singleton. So two instances
+(`audio-video-baseline` and `audio-video-pr1115`) can't run at once: shipping
+the candidate swaps the baseline's images on the one shared stack. A/B is
+therefore sequential, and you lose the baseline the moment you ship the
+candidate.
+
+Add a deploy method that stands the candidate up in its **own namespace**
+instead of the shared CSV, so baseline and candidate coexist:
+
+```yaml
+deploy:
+  method: standalone              # vs env-patch (CSV, singleton)
+  kube_context: ...
+  namespace: llm-d-pr1115         # instance-scoped; created if absent
+  manifests: ~/.../stacks/upstream   # full stack (Deployment/Service/
+                                      # InferencePool/Gateway), image-substituted
+```
+
+Requirements:
+- forge substitutes the freshly built image ref into the stack's workload
+  before apply (placeholder swap or kustomize image override).
+- Instance-scoped namespace ⇒ operator-managed baseline and standalone
+  candidate run in parallel; A/B is concurrent, not a destructive swap.
+- This is also the "upstream really means a non-RHOAI llm-d-native install"
+  path noted in #6's caveats.
+- Pairs with #8 (each namespace gets its own shape CRs) and #5 (cleanup
+  deletes the namespace/stack).
+
+**Note:** a deployment-scoped *patch* against the OLM-managed operator is the
+naive version, but OLM reconciles the deployment back to the CSV — so the
+viable mechanism is a standalone stack the operator doesn't own, not a patch
+it will revert.

@@ -1,0 +1,87 @@
+# PR #1115 build, exercised under RHOAI/KServe downstream-shape CRs.
+#
+# Same custom router build as `audio-video-pr1115-upstream`. Applies
+# LLMInferenceServiceConfig templates that match the RHOAI shipping path
+# so the test validates the PR works in the deployment shape Red Hat
+# customers will see.
+#
+# Prereqs (same as upstream — materialize the PR as a local branch pr-1115):
+#   cd ~/projects/llm-d/llm-d-inference-scheduler
+#   gh pr checkout 1115 --repo llm-d/llm-d-router -b pr-1115
+#
+# Same build as audio-video-pr1115-upstream: the `pr-1115` branch built in an
+# isolated git worktree, tagged pr1115-<short_sha>. Only the validation shape
+# differs.
+#
+# Usage:
+#   forge pipeline create audio-video-pr1115-downstream --from pipelines/audio-video-pr1115-downstream.yaml
+#   forge pipeline ship audio-video-pr1115-downstream --validate
+
+name: audio-video-pr1115-downstream
+
+images:
+  epp:
+    source: build
+    local: ~/projects/llm-d/llm-d-inference-scheduler
+    build_file: Dockerfile
+    git:
+      branch: pr-1115                           # created by the gh pr checkout above
+      worktree: /tmp/forge-llm-d-router-pr1115  # build in isolation
+    registry: quay.io:443/sbatsche
+    name_override: llm-d-router-pr1115
+    tag_template: "pr1115-{short_sha}"          # llm-d-router-pr1115:pr1115-a3b7c2d
+    env_var: RELATED_IMAGE_ODH_LLM_D_INFERENCE_SCHEDULER_IMAGE
+
+  routing-sidecar:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-routing-sidecar-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_ROUTING_SIDECAR_IMAGE
+
+  kvcache:
+    source: external
+    ref: quay.io/rhoai/odh-llm-d-kv-cache-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_LLM_D_KV_CACHE_IMAGE
+
+  kserve-storage-initializer:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-storage-initializer-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_STORAGE_INITIALIZER_IMAGE
+
+  kserve-controller:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-controller-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_CONTROLLER_IMAGE
+
+  kserve-agent:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-agent-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_AGENT_IMAGE
+
+  kserve-router:
+    source: external
+    ref: quay.io/rhoai/odh-kserve-router-rhel9:rhoai-3.4
+    env_var: RELATED_IMAGE_ODH_KSERVE_ROUTER_IMAGE
+
+deploy:
+  kube_context: default/api-dagobah-hexfusion-local:6443/kube:admin
+  namespace: redhat-ods-operator
+  target_deployment: rhods-operator
+  method: env-patch
+
+# Validation: same three modalities, exercised through LLMInferenceServiceConfig
+# CRs instead of native llm-d shape. Same image, different CR templating.
+validate:
+  - name: image-cache-affinity
+    command: ./scripts/test-image-affinity.sh --shape downstream
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600
+
+  - name: audio-cache-affinity
+    command: ./scripts/test-audio-affinity.sh --shape downstream
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600
+
+  - name: video-cache-affinity
+    command: ./scripts/test-video-affinity.sh --shape downstream
+    working_dir: ~/projects/hexfusion/experiments/llm-d/multimodal-routing-validation
+    timeout: 600
