@@ -1183,19 +1183,71 @@ func deployEnvPatch(name string, inst *Instance, def *PipelineDef, state *Instan
 		return err
 	}
 
+	// Apply the shape CRs/manifests once the operator has reconciled.
+	manifests, err := collectManifests(deploy)
+	if err != nil {
+		return err
+	}
+	if len(manifests) > 0 {
+		fmt.Printf("  Applying %d manifest(s)...\n", len(manifests))
+		if err := applyManifests(deploy.KubeContext, manifests); err != nil {
+			return err
+		}
+	}
+
 	// Record deploy state
 	now := time.Now()
 	state.Deploy = &DeployState{
-		KubeContext:    deploy.KubeContext,
-		Namespace:      deploy.Namespace,
-		Deployment:     deploy.TargetDeployment,
-		DeployedImages: deployedImages,
-		DeployTime:     &now,
-		DeployCommits:  collectCommits(inst),
-		Method:         "env-patch",
+		KubeContext:      deploy.KubeContext,
+		Namespace:        deploy.Namespace,
+		Deployment:       deploy.TargetDeployment,
+		DeployedImages:   deployedImages,
+		DeployTime:       &now,
+		DeployCommits:    collectCommits(inst),
+		Method:           "env-patch",
+		AppliedManifests: manifests,
 	}
 
 	return SaveState(state)
+}
+
+// collectManifests returns the ordered list of manifest files to apply: the
+// explicit Manifests first (as listed), then *.yaml/*.yml files in ManifestDir
+// (sorted by filename, which os.ReadDir already guarantees).
+func collectManifests(deploy *PipelineDeploy) ([]string, error) {
+	files := append([]string{}, deploy.Manifests...)
+	if deploy.ManifestDir != "" {
+		entries, err := os.ReadDir(deploy.ManifestDir)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest_dir %s: %w", deploy.ManifestDir, err)
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if name := e.Name(); strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+				files = append(files, filepath.Join(deploy.ManifestDir, name))
+			}
+		}
+	}
+	return files, nil
+}
+
+// applyManifests applies each manifest with `oc apply -f`, in order. It is
+// generic — no assumptions about CR kinds. No namespace is forced: each
+// manifest carries its own metadata.namespace, since the shape CRs usually
+// live in a different namespace than the operator CSV.
+func applyManifests(kubeContext string, files []string) error {
+	for _, f := range files {
+		if _, err := os.Stat(f); err != nil {
+			return fmt.Errorf("manifest not found: %s", f)
+		}
+		fmt.Printf("  applying manifest %s\n", f)
+		if err := runCmd(".", "oc", "--context", kubeContext, "apply", "-f", f); err != nil {
+			return fmt.Errorf("applying %s: %w", f, err)
+		}
+	}
+	return nil
 }
 
 // deployWithProfile deploys a full stack using a deploy profile.

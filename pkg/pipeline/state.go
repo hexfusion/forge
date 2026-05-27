@@ -98,9 +98,9 @@ type ImageState struct {
 
 // DeployState tracks what's deployed to a cluster.
 type DeployState struct {
-	KubeContext   string `yaml:"kube_context"`
-	Namespace     string `yaml:"namespace"`
-	Deployment    string `yaml:"deployment"`
+	KubeContext string `yaml:"kube_context"`
+	Namespace   string `yaml:"namespace"`
+	Deployment  string `yaml:"deployment"`
 
 	// DeployedDigest is the image digest that was last deployed.
 	DeployedDigest string `yaml:"deployed_digest,omitempty"`
@@ -116,6 +116,10 @@ type DeployState struct {
 
 	// Method is the deploy strategy used (e.g., "env-patch").
 	Method string `yaml:"method,omitempty"`
+
+	// AppliedManifests lists the manifest files applied at deploy time, in
+	// order, so cleanup (RFE #5) can delete them on teardown.
+	AppliedManifests []string `yaml:"applied_manifests,omitempty"`
 }
 
 // DriftStatus describes the relationship between built, pushed, and deployed state.

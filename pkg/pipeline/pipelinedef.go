@@ -101,6 +101,17 @@ type PipelineDeploy struct {
 
 	// Method is the deploy strategy. Currently only "env-patch".
 	Method string `yaml:"method"`
+
+	// Manifests are CR/manifest files applied after the image patch + rollout,
+	// in the order listed. They define the deployment "shape" (e.g. native
+	// InferencePool + gateway vs LLMInferenceServiceConfig). Each manifest
+	// carries its own metadata.namespace — the deploy namespace targets the
+	// operator CSV, which usually differs from where the shape CRs live.
+	Manifests []string `yaml:"manifests,omitempty"`
+
+	// ManifestDir is a directory whose *.yaml/*.yml files are applied after
+	// the image patch, in sorted filename order, following Manifests.
+	ManifestDir string `yaml:"manifest_dir,omitempty"`
 }
 
 // ValidateStep is a post-deploy validation command.
@@ -215,6 +226,12 @@ func LoadPipelineDef(path string) (*PipelineDef, error) {
 	}
 	for i := range def.Validate {
 		def.Validate[i].WorkingDir = expandHome(def.Validate[i].WorkingDir)
+	}
+	if def.Deploy != nil {
+		for i := range def.Deploy.Manifests {
+			def.Deploy.Manifests[i] = expandHome(def.Deploy.Manifests[i])
+		}
+		def.Deploy.ManifestDir = expandHome(def.Deploy.ManifestDir)
 	}
 
 	return &def, nil

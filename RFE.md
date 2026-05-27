@@ -103,9 +103,16 @@ images:
 Defaults to local. SSH-remote is the smallest viable second backend (rsync
 the source, run podman/docker over ssh, push from the remote directly).
 
-## 8. Declarative CR/manifest apply (deploy shapes)
+## 8. Declarative CR/manifest apply (deploy shapes) ✅ Implemented
 
 From the audio/video PR #1115 validation (2026-05-27).
+
+Implemented for the `env-patch` deploy method: `manifests:`/`manifest_dir:`
+are applied with `oc apply -f` after the CSV patch + rollout, in order
+(explicit list first, then the directory sorted by filename). No namespace is
+forced — each manifest carries its own `metadata.namespace`, since the shape
+CRs live in the workload namespace, not the operator's. Applied files are
+recorded in deploy state (`applied_manifests`) for teardown via #5.
 
 `deploy` today only patches operator *images* (`method: env-patch` on the
 CSV). It can't apply the *CRs* that define the deployment **shape** — native
