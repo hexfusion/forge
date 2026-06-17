@@ -181,3 +181,76 @@ Requirements:
 naive version, but OLM reconciles the deployment back to the CSV — so the
 viable mechanism is a standalone stack the operator doesn't own, not a patch
 it will revert.
+
+## 10. Forge as an e2e harness: capture -> assert -> sequence
+
+From the multimodal precise-affinity benchmarking (2026-06-17).
+
+Forge already owns the expensive 80% of an e2e flow: provision (`cluster
+create`) -> multi-repo build + push (`pipeline`) -> deploy (env-patch /
+standalone) -> exercise (`benchmark run`). That is exactly the part upstream
+CI can't do: real GPUs, RDMA, multi-repo source builds, real routing behavior.
+To become an e2e harness it needs three more bricks, in order. Forge's niche is
+real-cluster, multi-repo, hardware-in-the-loop e2e — complementing upstream's
+kind/CI e2e, not replacing it.
+
+**Context:** the benchmarking runs are expensive and produced two failures we
+caught only after the fact — an EPP OOM (16Gi limit under 4k-image load) that
+wasted a run, and the "which arm actually ran / did the prefix plugin have a
+data feed" questions we had to reverse-engineer after scale-down (deleted-pod
+logs are gone). Both are evidence-capture + assertion gaps.
+
+### 10.1 Capture ✅ Implemented
+
+`forge benchmark capture [instance | --namespace ...]`. Snapshots an arm's
+evidence before teardown: pod logs (EPP + `-s` selectors), a structured
+`manifest.json` (images, restart counts, last-terminated reason for OOM
+detection, readiness, the loaded EPP `Scorers:` line = which arm ran), and
+optional Prometheus metrics (`--prom-url` namespace-scoped range-queries;
+`--prom-snapshot` triggers the admin TSDB snapshot API where we own the Prom).
+Output is structured so the assert layer consumes it without reparsing text.
+
+### 10.2 Assert
+
+A gate layer that reads `manifest.json` + the captured metrics and returns
+pass/fail. The checks are the things we hand-verified this session, made
+declarative:
+
+```yaml
+assert:
+  pods:
+    no_oom: true                 # no lastTerm == OOMKilled
+    max_restarts: 0
+    all_ready: true
+  epp:
+    scorers_contains: ["prefix-cache-scorer", "mm-embeddings-cache-scorer"]
+  metrics:                       # from the captured series
+    - { name: ttft_p90, at_qps: 12, max: 4.0 }
+    - { name: achieved_rate, at_qps: 12, min: 11.5 }
+```
+
+Requirements: consumes the capture manifest + metric JSON (no live cluster
+needed at assert time); emits a junit-ish result; non-zero exit on failure so
+it gates CI.
+
+### 10.3 Sequence
+
+A scenario runner that chains the existing steps with gates and teardown:
+deploy -> wait-ready -> capture(pre) -> benchmark run -> capture(post) ->
+assert -> cleanup (#5). Fails fast at any gate. The scenario is a declarative
+artifact like the pipeline/bench config, so an e2e run is reproducible:
+
+```yaml
+scenario: multimodal-composed-vs-prefix
+instance: ...
+arms:                            # each: an EPP config + workload
+  - { name: prefix-only, epp_config: ..., workload: multiturn }
+  - { name: composed,    epp_config: ..., workload: multiturn }
+on_each_arm: [deploy, wait_ready, run, capture, assert]
+teardown: always
+```
+
+Requirements: ordered steps with fail-fast gates; `teardown: always` so an
+expensive run never leaks GPU; per-arm capture dirs feed a final comparison.
+This is where the benchmark-matrix work (run N arms, snapshot each, plot
+together) becomes a first-class forge capability instead of shell glue.
