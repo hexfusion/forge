@@ -254,3 +254,48 @@ Requirements: ordered steps with fail-fast gates; `teardown: always` so an
 expensive run never leaks GPU; per-arm capture dirs feed a final comparison.
 This is where the benchmark-matrix work (run N arms, snapshot each, plot
 together) becomes a first-class forge capability instead of shell glue.
+
+## 11. Benchmark catalog: searchable run metadata + review backend
+
+From the multimodal benchmarking (2026-06-17). Once you run many arms, the
+question becomes "what did we test, with which versions, and what did we get?"
+Today results are scattered: raw stage JSON on the harness PVC, evidence in
+`capture` dirs, configs in git — nothing searchable.
+
+### 11.1 Run metadata in the capture manifest ✅ Partial
+
+`capture` records searchable `versions` in `manifest.json`: served `model`,
+`modelServerImage` (vLLM version in the tag), `eppImage` (llm-d-router build),
+`gpuProduct` (e.g. H200), plus the EPP scorers+weights signature (read from the
+ConfigMap, not logs — the startup log line rotates out under load). Still to
+fold in: the workload YAML and a `results.json` (per-stage achieved-rate /
+TTFT / tok/s, lifted off the harness PVC) so a run dir is fully self-describing.
+
+### 11.2 Catalog CLI
+
+`forge benchmark list` / `show <run-id>` / `search` over the manifests in the
+capture root. Search on the metadata: `--vllm 0.23`, `--gpu H200`, `--scorer
+prefix-cache`, `--model Qwen3-VL`. A CLI table first — no web stack — for
+immediate value as the corpus grows.
+
+```
+forge benchmark list
+RUN-ID                         DATE        VLLM     GPU   ARM(scorers)              KNEE  TOK/S
+multiturn-composed-...         06-17       v0.23.0  H200  prefix5,embed3,...        ~42   10.9k
+multiturn-prefix-...           06-17       v0.23.0  H200  prefix10,...              ...   ...
+```
+
+### 11.3 Review backend (Prometheus + Grafana)
+
+A forge-managed, in-namespace Prometheus (PodMonitor scraping our pods, so no
+shared-tenant contamination) + Grafana with EPP/vLLM/DCGM dashboards, for
+*interactive* review of a live or recent run. Separate from capture: capture is
+the durable JSON record (source of truth); Grafana is the eyeball layer. The
+metrics-backend sibling of a Loki logs-backend (see capture's `--prom-snapshot`
+note for why we pull our slice rather than snapshot a shared TSDB).
+
+### 11.4 Web UI (later)
+
+A thin web view over the same `manifest.json` corpus — browse/search runs, diff
+two arms, render the per-stage charts. Build only once 11.2 has a corpus worth
+browsing; it reads the same metadata, adds no new source of truth.

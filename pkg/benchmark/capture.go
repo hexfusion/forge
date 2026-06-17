@@ -54,9 +54,20 @@ type Manifest struct {
 	CapturedAt  string      `json:"capturedAt"`
 	KubeContext string      `json:"kubeContext"`
 	Namespace   string      `json:"namespace"`
+	Versions    Versions    `json:"versions"`   // searchable metadata for the catalog (RFE #11)
 	EPPScorers  string      `json:"eppScorers"` // the loaded profile line: proves which arm ran
 	Pods        []PodStatus `json:"pods"`
 	Sanity      []string    `json:"sanity"` // failed gates; empty == sane
+}
+
+// Versions is the searchable run metadata: what stack actually ran. Derived
+// from the live pods + nodes so a catalog can filter ("all runs with vLLM
+// 0.23 + H200"). Image tags are the source of truth for the build under test.
+type Versions struct {
+	Model            string `json:"model"`            // served model (model-server positional arg)
+	ModelServerImage string `json:"modelServerImage"` // vLLM image ref (tag carries the version)
+	EPPImage         string `json:"eppImage"`         // llm-d-router EPP image ref
+	GPUProduct       string `json:"gpuProduct"`       // e.g. H200, from node labels
 }
 
 // PodStatus is the per-pod evidence an assert layer gates on.
@@ -110,7 +121,8 @@ func Capture(d *pipeline.DeployConfig, name string, opts CaptureOptions, stderr 
 	if err != nil {
 		fmt.Fprintf(stderr, "warn: pod status capture failed: %v\n", err)
 	}
-	m.EPPScorers = captureEPPScorers(d, pods, stderr)
+	m.Versions = captureVersions(d, pods)
+	m.EPPScorers = captureEPPScorers(d, pods)
 
 	// Logs: EPP pods (all containers) + any pod matching the extra selectors.
 	logTargets := filterPods(pods, "app.kubernetes.io/name="+d.EPPDeployment, d.EPPDeployment)
@@ -166,8 +178,9 @@ type podList struct {
 		} `json:"metadata"`
 		Spec struct {
 			Containers []struct {
-				Name  string `json:"name"`
-				Image string `json:"image"`
+				Name  string   `json:"name"`
+				Image string   `json:"image"`
+				Args  []string `json:"args"`
 			} `json:"containers"`
 		} `json:"spec"`
 		Status struct {
@@ -221,26 +234,147 @@ func capturePods(d *pipeline.DeployConfig, m *Manifest) (*podList, error) {
 	return &pl, nil
 }
 
-// captureEPPScorers greps the loaded scheduling profile from the EPP log —
-// the line that proves which arm actually ran.
-func captureEPPScorers(d *pipeline.DeployConfig, pods *podList, stderr io.Writer) string {
+// captureEPPScorers extracts the scheduling-profile scorers+weights from the
+// EPP ConfigMap — the "which arm ran" signature. The CM is the reliable source:
+// under load the startup log line rotates out of kubelet retention, and our
+// workflow restarts the EPP to change config so the CM == the loaded profile.
+// The CM often holds several profile keys; read the exact one the EPP loads
+// (its --config-file basename), not a random key.
+func captureEPPScorers(d *pipeline.DeployConfig, pods *podList) string {
+	if d.EPPDeployment == "" {
+		return ""
+	}
+	out, err := kubectl(d, "get", "cm", d.EPPDeployment, "-o", "json")
+	if err != nil {
+		return ""
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if json.Unmarshal(out, &cm) != nil {
+		return ""
+	}
+	if key := eppConfigKey(pods, d.EPPDeployment); key != "" {
+		if v, ok := cm.Data[key]; ok {
+			return scanProfileScorers(v)
+		}
+	}
+	for _, v := range cm.Data { // fallback: any profile (less reliable with multiple keys)
+		if strings.Contains(v, "schedulingProfiles") {
+			return scanProfileScorers(v)
+		}
+	}
+	return ""
+}
+
+// eppConfigKey returns the CM key the EPP loads, from its --config-file arg.
+func eppConfigKey(pods *podList, eppPrefix string) string {
 	if pods == nil {
 		return ""
 	}
 	for _, p := range pods.Items {
-		if !strings.HasPrefix(p.Metadata.Name, d.EPPDeployment) {
+		if !strings.HasPrefix(p.Metadata.Name, eppPrefix) {
 			continue
 		}
-		out, err := kubectl(d, "logs", p.Metadata.Name, "-c", "epp", "--tail", "800")
-		if err != nil {
-			fmt.Fprintf(stderr, "warn: epp log for %s: %v\n", p.Metadata.Name, err)
-			return ""
-		}
-		for _, line := range strings.Split(string(out), "\n") {
-			if i := strings.Index(line, "Scorers: ["); i >= 0 {
-				if j := strings.Index(line[i:], "]"); j >= 0 {
-					return line[i : i+j+1]
+		for _, c := range p.Spec.Containers {
+			if c.Name != "epp" {
+				continue
+			}
+			for i, a := range c.Args {
+				if strings.HasPrefix(a, "--config-file=") {
+					return filepath.Base(strings.TrimPrefix(a, "--config-file="))
 				}
+				if a == "--config-file" && i+1 < len(c.Args) {
+					return filepath.Base(c.Args[i+1])
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// scanProfileScorers pulls `pluginRef: X` + `weight: N` pairs out of the
+// schedulingProfiles block (weighted scorers only; filters/pickers have no
+// weight). Avoids a YAML dependency for a single shallow scan.
+func scanProfileScorers(s string) string {
+	in := false
+	ref := ""
+	var out []string
+	for _, ln := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(t, "schedulingProfiles"):
+			in = true
+		case !in:
+			continue
+		case strings.HasPrefix(t, "- pluginRef:"):
+			ref = strings.TrimSpace(strings.TrimPrefix(t, "- pluginRef:"))
+		case strings.HasPrefix(t, "pluginRef:"):
+			ref = strings.TrimSpace(strings.TrimPrefix(t, "pluginRef:"))
+		case strings.HasPrefix(t, "weight:") && ref != "":
+			out = append(out, ref+":"+strings.TrimSpace(strings.TrimPrefix(t, "weight:")))
+			ref = ""
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// captureVersions derives searchable stack metadata from the live pods + nodes.
+func captureVersions(d *pipeline.DeployConfig, pods *podList) Versions {
+	var v Versions
+	if pods != nil {
+		for _, p := range pods.Items {
+			isDecode := strings.Contains(p.Metadata.Name, "decode")
+			for _, c := range p.Spec.Containers {
+				if c.Name == "epp" {
+					v.EPPImage = c.Image
+					continue
+				}
+				if c.Name == "modelserver" || strings.Contains(c.Image, "vllm") {
+					if v.ModelServerImage != "" && !isDecode {
+						continue // a decode match wins over render (vllm-openai-cpu)
+					}
+					v.ModelServerImage = c.Image
+					for _, a := range c.Args { // first positional (non-flag) arg is the model
+						if !strings.HasPrefix(a, "-") {
+							v.Model = a
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	v.GPUProduct = gpuProduct(d)
+	return v
+}
+
+// gpuProduct reads nvidia.com/gpu.product off the first GPU node (cluster-scoped
+// read; best-effort, blank if not permitted).
+func gpuProduct(d *pipeline.DeployConfig) string {
+	args := []string{}
+	if d.KubeContext != "" {
+		args = append(args, "--context", d.KubeContext)
+	}
+	args = append(args, "get", "nodes", "-o", "json")
+	out, err := exec.Command("kubectl", args...).Output()
+	if err != nil {
+		return ""
+	}
+	var nl struct {
+		Items []struct {
+			Metadata struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(out, &nl) != nil {
+		return ""
+	}
+	for _, n := range nl.Items {
+		for _, key := range []string{"nvidia.com/gpu.product", "gpu.nvidia.com/class"} {
+			if p := n.Metadata.Labels[key]; p != "" {
+				return p
 			}
 		}
 	}
