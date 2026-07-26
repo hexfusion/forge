@@ -1,3 +1,9 @@
 # Built binary at repo root, not the cmd/forge/ source dir.
 /forge
 
+# Personal/local pipeline defs are scratch; curated examples live in examples/.
+/pipelines/
+
+# Generated planning artifacts (benchmark capture, RFE catalogs).
+RFE.md
+
