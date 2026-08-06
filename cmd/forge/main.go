@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/hexfusion/forge/pkg/benchmark"
 	"github.com/hexfusion/forge/pkg/cluster"
 	"github.com/hexfusion/forge/pkg/pipeline"
+	"github.com/hexfusion/forge/pkg/release"
 	"github.com/spf13/cobra"
 )
 
@@ -27,6 +29,8 @@ func newRootCommand() *cobra.Command {
 
 	cmd.AddCommand(cluster.NewCommand())
 	cmd.AddCommand(pipeline.NewCommand())
+	cmd.AddCommand(benchmark.NewCommand())
+	cmd.AddCommand(release.NewCommand())
 	cmd.AddCommand(newCompletionCommand())
 
 	return cmd

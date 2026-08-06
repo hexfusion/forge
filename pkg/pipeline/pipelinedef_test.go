@@ -259,6 +259,144 @@ func TestPipelineImageImageTag(t *testing.T) {
 	}
 }
 
+func TestPipelineImageResolveTag(t *testing.T) {
+	info := GitBuildInfo{Branch: "fix-37581", ShortSHA: "a3b7c2d", FullSHA: "a3b7c2d9e1f0aa11bb22cc33dd44ee55ff667788"}
+
+	tests := []struct {
+		name string
+		img  *PipelineImage
+		key  string
+		info GitBuildInfo
+		want string
+	}{
+		{
+			name: "no template falls back to instance-name tag",
+			img:  &PipelineImage{Source: "build", Registry: "quay.io:443/sbatsche", NameOverride: "vllm"},
+			key:  "vllm",
+			info: info,
+			want: "quay.io:443/sbatsche/vllm:my-test",
+		},
+		{
+			name: "branch + short_sha template",
+			img:  &PipelineImage{Source: "build", Registry: "quay.io:443/sbatsche", NameOverride: "vllm", TagTemplate: "{branch}-{short_sha}"},
+			key:  "vllm",
+			info: info,
+			want: "quay.io:443/sbatsche/vllm:fix-37581-a3b7c2d",
+		},
+		{
+			name: "full_sha template",
+			img:  &PipelineImage{Source: "build", Registry: "r", TagTemplate: "{full_sha}"},
+			key:  "img",
+			info: info,
+			want: "r/img:a3b7c2d9e1f0aa11bb22cc33dd44ee55ff667788",
+		},
+		{
+			name: "slash in branch is sanitized",
+			img:  &PipelineImage{Source: "build", Registry: "r", TagTemplate: "{branch}"},
+			key:  "img",
+			info: GitBuildInfo{Branch: "feature/audio-fix", ShortSHA: "abc1234"},
+			want: "r/img:feature-audio-fix",
+		},
+		{
+			name: "no registry uses localhost; key used when no override",
+			img:  &PipelineImage{Source: "build", TagTemplate: "{short_sha}"},
+			key:  "kvcache",
+			info: info,
+			want: "localhost/kvcache:a3b7c2d",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.img.ResolveTag(tt.key, "my-test", tt.info); got != tt.want {
+				t.Errorf("ResolveTag = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPipelineImageResolveTagTimestamp(t *testing.T) {
+	img := &PipelineImage{Source: "build", Registry: "r", TagTemplate: "build-{timestamp}"}
+	got := img.ResolveTag("img", "inst", GitBuildInfo{})
+	const prefix = "r/img:build-"
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("ResolveTag = %q, want prefix %q", got, prefix)
+	}
+	ts := strings.TrimPrefix(got, prefix)
+	if _, err := time.Parse("20060102-150405", ts); err != nil {
+		t.Errorf("timestamp %q not in expected format: %v", ts, err)
+	}
+}
+
+func TestSanitizeTag(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"fix-37581-a3b7c2", "fix-37581-a3b7c2"},
+		{"feature/audio", "feature-audio"},
+		{"weird:tag@v1", "weird-tag-v1"},
+		{"-leading.dash", "leading.dash"},
+		{".dotstart", "dotstart"},
+		{"keep_under.scores-1", "keep_under.scores-1"},
+		{strings.Repeat("x", 200), strings.Repeat("x", 128)},
+	}
+	for _, tt := range tests {
+		if got := sanitizeTag(tt.in); got != tt.want {
+			t.Errorf("sanitizeTag(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestLoadPipelineDefGit(t *testing.T) {
+	dir := t.TempDir()
+	yamlStr := `
+name: gitbuild
+images:
+  vllm:
+    source: build
+    local: /tmp/vllm
+    build_file: Dockerfile
+    git:
+      branch: fix-37581
+      remote: origin
+      worktree: /tmp/forge-vllm
+    registry: quay.io:443/sbatsche
+    name_override: vllm
+    tag_template: "{branch}-{short_sha}"
+`
+	path := filepath.Join(dir, "pipeline.yaml")
+	if err := os.WriteFile(path, []byte(yamlStr), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	def, err := LoadPipelineDef(path)
+	if err != nil {
+		t.Fatalf("LoadPipelineDef: %v", err)
+	}
+	img := def.Images["vllm"]
+	if img == nil {
+		t.Fatal("vllm image not found")
+	}
+	if img.Git == nil {
+		t.Fatal("git sub-struct is nil")
+	}
+	if img.Git.Branch != "fix-37581" {
+		t.Errorf("git.branch = %q", img.Git.Branch)
+	}
+	if img.Git.Remote != "origin" {
+		t.Errorf("git.remote = %q", img.Git.Remote)
+	}
+	if img.Git.Worktree != "/tmp/forge-vllm" {
+		t.Errorf("git.worktree = %q", img.Git.Worktree)
+	}
+	if img.TagTemplate != "{branch}-{short_sha}" {
+		t.Errorf("tag_template = %q", img.TagTemplate)
+	}
+	if img.BuildFile != "Dockerfile" {
+		t.Errorf("build_file = %q", img.BuildFile)
+	}
+}
+
 func TestPipelineDefToInstance(t *testing.T) {
 	def := &PipelineDef{
 		Name: "test-pipeline",

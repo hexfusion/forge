@@ -5,7 +5,7 @@
 # directives, image tags, and which repos need branches.
 #
 # Usage:
-#   forge pipeline create my-feature --project llm-d --repos gateway-api-inference-extension,llm-d-inference-scheduler
+#   forge pipeline create my-feature --project llm-d --repos gateway-api-inference-extension,llm-d-router
 
 name: llm-d
 
@@ -16,11 +16,11 @@ repos:
     module: sigs.k8s.io/gateway-api-inference-extension
     local: ~/projects/llm-d/gateway-api-inference-extension
 
-  llm-d-inference-scheduler:
-    upstream: llm-d/llm-d-inference-scheduler
-    fork: hexfusion/llm-d-inference-scheduler
-    module: github.com/llm-d/llm-d-inference-scheduler
-    local: ~/projects/llm-d/llm-d-inference-scheduler
+  llm-d-router:
+    upstream: llm-d/llm-d-router
+    fork: hexfusion/llm-d-router
+    module: github.com/llm-d/llm-d-router
+    local: ~/projects/llm-d/llm-d-router
     images:
       epp:
         build_file: Dockerfile.epp
@@ -43,6 +43,13 @@ repos:
     module: github.com/llm-d/llm-d-inference-sim
     local: ~/projects/llm-d/llm-d-inference-sim
 
+  # Umbrella repo. Released on its own version line, behind the
+  # components it pins, so forge release validates it separately.
+  llm-d:
+    upstream: llm-d/llm-d
+    fork: hexfusion/llm-d
+    local: ~/projects/llm-d/llm-d
+
   vllm:
     upstream: vllm-project/vllm
     fork: hexfusion/vllm
@@ -61,12 +68,12 @@ repos:
 #            A's image needs rebuilding.
 dependencies:
   # Scheduler imports GIE framework
-  - from: llm-d-inference-scheduler
+  - from: llm-d-router
     to: gateway-api-inference-extension
     type: go-module
 
   # Scheduler imports KV cache library
-  - from: llm-d-inference-scheduler
+  - from: llm-d-router
     to: llm-d-kv-cache
     type: go-module
 

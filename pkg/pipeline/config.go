@@ -26,6 +26,7 @@ type Instance struct {
 	ExternalImages    map[string]string      `yaml:"external_images,omitempty"`
 	ReplaceDirectives []ReplaceDirective     `yaml:"replace_directives"`
 	Deploy            *DeployConfig          `yaml:"deploy,omitempty"`
+	Bench             *BenchConfig           `yaml:"bench,omitempty"`
 	Proposal          string                 `yaml:"proposal,omitempty"`
 
 	// PipelineFile is the path to the source pipeline def YAML
@@ -53,6 +54,31 @@ type DeployConfig struct {
 	KubeContext   string `yaml:"kube_context"`
 	Namespace     string `yaml:"namespace"`
 	EPPDeployment string `yaml:"epp_deployment"`
+}
+
+// BenchConfig wires an instance to llm-d-benchmark — a thin record of
+// which harness, workload, and target selector to pass to run.sh.
+// Forge does not own benchmark logic; it just plugs in the targeting
+// already known from the instance's Deploy config.
+type BenchConfig struct {
+	// Harness is the load generator name (e.g. "inference-perf",
+	// "guidellm", "vllm-benchmark"). Defaults to "inference-perf".
+	Harness string `yaml:"harness,omitempty"`
+
+	// Workload is the named profile under llm-d-benchmark/workload/profiles/<harness>/.
+	Workload string `yaml:"workload"`
+
+	// Methods is run.sh's --methods flag — pod, service, or LLMIS name
+	// matching the resource to target. Falls back to Deploy.EPPDeployment
+	// if empty.
+	Methods string `yaml:"methods,omitempty"`
+
+	// Parallelism is the number of harness pods (run.sh -j).
+	Parallelism int `yaml:"parallelism,omitempty"`
+
+	// Overrides is the comma-separated profile parameter override list
+	// passed to run.sh -o.
+	Overrides string `yaml:"overrides,omitempty"`
 }
 
 // LoadConfig reads the pipeline instances config file.
